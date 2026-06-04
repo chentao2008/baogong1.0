@@ -30,7 +30,15 @@ docs/                 项目文档和开发约定
 
 后续开发前先阅读：
 
-- [第一版开发约定](docs/dev-agreement.md)
-- [前端公共布局和基础样式规范](docs/frontend-ui-guidelines.md)
+- [开发约定和业务规则](docs/dev-agreement.md)
 - [API 规范文档](docs/api-guidelines.md)
+- [前端公共布局和基础样式规范](docs/frontend-ui-guidelines.md)
 - [下一步开发清单](docs/next-steps.md)
+
+建议开发顺序：
+
+1. 先确认业务规则。
+2. 再确认或设计 API。
+3. 后端实现权限、校验和业务逻辑。
+4. 前端实现页面展示和交互。
+5. 最后补测试并更新文档。

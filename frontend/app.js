@@ -1252,6 +1252,18 @@
     return reportDates[0] || "";
   }
 
+  function getNextReportedDate(historyRows, currentDate) {
+    const reportDates = Array.from(
+      new Set(
+        historyRows
+          .map((row) => row.workDate || row.work_date || "")
+          .filter((workDate) => workDate && workDate > currentDate)
+      )
+    ).sort((left, right) => left.localeCompare(right));
+
+    return reportDates[0] || "";
+  }
+
   function bindReportSwipe(historyRows, workDate) {
     const tableWrap = document.querySelector(".report-table-wrap");
     if (!tableWrap) return;
@@ -1281,11 +1293,11 @@
         startX = null;
         startY = null;
 
-        if (deltaX < 70 || Math.abs(deltaY) > 60 || deltaX < Math.abs(deltaY) * 1.4) return;
+        if (Math.abs(deltaX) < 70 || Math.abs(deltaY) > 60 || Math.abs(deltaX) < Math.abs(deltaY) * 1.4) return;
 
-        const previousDate = getPreviousReportedDate(historyRows, workDate);
-        if (previousDate) {
-          renderEmployeeWorkReport(previousDate);
+        const targetDate = deltaX > 0 ? getPreviousReportedDate(historyRows, workDate) : getNextReportedDate(historyRows, workDate);
+        if (targetDate) {
+          renderEmployeeWorkReport(targetDate);
         }
       },
       { passive: true }
@@ -2173,7 +2185,7 @@
 
   function getAdminQueryDetailRows(rows) {
     return [...rows].sort((left, right) => {
-      const dateOrder = left.workDate.localeCompare(right.workDate);
+      const dateOrder = right.workDate.localeCompare(left.workDate);
       if (dateOrder) return dateOrder;
       const employeeOrder = left.accountName.localeCompare(right.accountName, "zh-CN");
       if (employeeOrder) return employeeOrder;
