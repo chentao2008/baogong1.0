@@ -4,6 +4,8 @@
   const STORAGE_USER_KEY = "currentUser";
   const STORAGE_DATA_KEY = "demoAdminData";
   const PROCESS_PAGE_SIZE = 10;
+  let accountApiAvailable = false;
+  let latestAdminData = null;
   let currentProcessPage = 1;
   let processApiAvailable = false;
 
@@ -55,10 +57,11 @@
     "/": renderLogin,
     "/login": renderLogin,
     "/employee": renderEmployeeWorkReport,
+    "/employee/query": renderEmployeeHistoryQuery,
     "/admin": renderAccountManagement,
     "/admin/accounts": renderAccountManagement,
     "/admin/processes": renderProcessManagement,
-    "/admin/query": renderAdminQueryPlaceholder,
+    "/admin/query": renderAdminQuery,
   };
 
   window.addEventListener("hashchange", renderRoute);
@@ -84,11 +87,14 @@
 
     const legacySessionData = readStorageData(sessionStorage);
     if (legacySessionData) {
-      writeData(legacySessionData);
       return legacySessionData;
     }
 
     return clone(defaultData);
+  }
+
+  function getLatestAdminData() {
+    return latestAdminData || readData();
   }
 
   function readStorageData(storage) {
@@ -102,10 +108,6 @@
     }
 
     return null;
-  }
-
-  function writeData(data) {
-    localStorage.setItem(STORAGE_DATA_KEY, JSON.stringify(data));
   }
 
   function getApiBaseUrl() {
@@ -136,7 +138,6 @@
       const remoteProcesses = await apiRequest("/api/admin/processes");
       processApiAvailable = true;
       localData.processes = remoteProcesses;
-      writeData(localData);
       return localData;
     } catch (error) {
       processApiAvailable = false;
@@ -144,9 +145,85 @@
     }
   }
 
-  async function createSharedProcess(process) {
-    if (!processApiAvailable) return false;
+  async function loadSharedAccounts(localData) {
+    try {
+      let remoteAccounts = await apiRequest("/api/admin/accounts");
+      accountApiAvailable = true;
+      remoteAccounts = await migrateLocalAccounts(localData.accounts, remoteAccounts);
+      localData.accounts = remoteAccounts;
+      return localData;
+    } catch (error) {
+      accountApiAvailable = false;
+      return localData;
+    }
+  }
 
+  async function migrateLocalAccounts(localAccounts, remoteAccounts) {
+    const remoteNames = new Set(remoteAccounts.map((account) => account.account));
+    const localOnlyAccounts = localAccounts.filter((account) => account.account && !remoteNames.has(account.account));
+
+    if (!localOnlyAccounts.length) return remoteAccounts;
+
+    for (const account of localOnlyAccounts) {
+      try {
+        await apiRequest("/api/admin/accounts", {
+          method: "POST",
+          body: JSON.stringify({
+            account: account.account,
+            password: account.password,
+            role: account.role,
+            name: account.name || account.account,
+            status: account.status || "active",
+            manager_id: account.managerId || null,
+            process_ids: account.processIds || [],
+          }),
+        });
+      } catch (error) {
+        // 本地演示账号迁移只做尽力同步，重名或临时网络失败不阻塞页面。
+      }
+    }
+
+    return apiRequest("/api/admin/accounts");
+  }
+
+  async function loginSharedAccount(account, password) {
+    try {
+      const user = await apiRequest("/api/login", {
+        method: "POST",
+        body: JSON.stringify({ account, password }),
+      });
+      accountApiAvailable = true;
+      return user;
+    } catch (error) {
+      accountApiAvailable = false;
+      return null;
+    }
+  }
+
+  async function createSharedAccount(account) {
+    await apiRequest("/api/admin/accounts", {
+      method: "POST",
+      body: JSON.stringify(account),
+    });
+    return true;
+  }
+
+  async function updateSharedAccount(accountId, patch) {
+    await apiRequest(`/api/admin/accounts/${encodeURIComponent(accountId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+    return true;
+  }
+
+  async function deleteSharedAccount(accountId) {
+    await apiRequest(`/api/admin/accounts/${encodeURIComponent(accountId)}`, {
+      method: "DELETE",
+    });
+    return true;
+  }
+
+  async function createSharedProcess(process) {
     await apiRequest("/api/admin/processes", {
       method: "POST",
       body: JSON.stringify(process),
@@ -155,8 +232,6 @@
   }
 
   async function updateSharedProcess(processId, patch) {
-    if (!processApiAvailable) return false;
-
     await apiRequest(`/api/admin/processes/${encodeURIComponent(processId)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
@@ -165,12 +240,29 @@
   }
 
   async function deleteSharedProcess(processId) {
-    if (!processApiAvailable) return false;
-
     await apiRequest(`/api/admin/processes/${encodeURIComponent(processId)}`, {
       method: "DELETE",
     });
     return true;
+  }
+
+  async function loadEmployeeProcesses(accountId) {
+    return apiRequest(`/api/accounts/${encodeURIComponent(accountId)}/processes`);
+  }
+
+  async function loadWorkReport(accountId, workDate) {
+    return apiRequest(`/api/work-reports/${encodeURIComponent(accountId)}/${encodeURIComponent(workDate)}`);
+  }
+
+  async function saveWorkReport(accountId, workDate, rows) {
+    return apiRequest(`/api/work-reports/${encodeURIComponent(accountId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ work_date: workDate, rows }),
+    });
+  }
+
+  async function loadWorkReportHistory(accountId) {
+    return apiRequest(`/api/work-report-history/${encodeURIComponent(accountId)}`);
   }
 
   function clone(value) {
@@ -288,14 +380,26 @@
     `;
   }
 
-  function handleLogin(event) {
+  async function handleLogin(event) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const account = String(form.get("account") || "").trim();
     const password = String(form.get("password") || "");
     const data = readData();
-    const matchedUser = data.accounts.find((item) => item.account === account);
     const error = document.querySelector("#loginError");
+    let matchedUser = await loginSharedAccount(account, password);
+
+    if (!matchedUser) {
+      matchedUser = data.accounts.find((item) => item.account === account);
+      if (matchedUser && matchedUser.password === password && matchedUser.status === "active") {
+        try {
+          await migrateLocalAccounts(data.accounts, []);
+          matchedUser = await loginSharedAccount(account, password);
+        } catch (migrationError) {
+          matchedUser = null;
+        }
+      }
+    }
 
     if (!matchedUser || matchedUser.password !== password || matchedUser.status !== "active") {
       error.classList.add("is-visible");
@@ -307,13 +411,14 @@
       account: matchedUser.account,
       name: matchedUser.name,
       role: matchedUser.role,
+      processIds: matchedUser.processIds || [],
     };
 
     setCurrentUser(user);
     navigate(user.role === "employee" ? "/employee" : "/admin/accounts");
   }
 
-  function renderEmployeeWorkReport() {
+  async function renderEmployeeWorkReport(selectedDate) {
     const user = requireEmployee();
     if (!user) return;
 
@@ -321,26 +426,75 @@
       <main class="app-page employee-layout">
         ${renderAppHeader()}
         <section class="employee-shell">
-          <header class="employee-header">
-            <h1 class="page-title">员工报工</h1>
-            <p class="page-subtitle">${escapeHtml(user.name)}，当前为报工页面占位，后续接入工序、数量和工资汇总。</p>
-          </header>
-          <section class="employee-summary" aria-label="工资汇总">
-            <div class="summary-item">
-              <p class="summary-label">今日金额</p>
-              <p class="summary-value">¥0.00</p>
-            </div>
-            <div class="summary-item">
-              <p class="summary-label">当月汇总</p>
-              <p class="summary-value">¥0.00</p>
-            </div>
-          </section>
           <section class="panel placeholder-card">
-            <h2>报工表单占位</h2>
-            <p>这里将放置日期、工序、数量和提交按钮。员工账号登录后只进入此页面，不能进入后台。</p>
+            <h2>报工表加载中</h2>
+          </section>
+        </section>
+      </main>
+    `;
+
+    const today = getLocalDateString(new Date());
+    const workDate = selectedDate && selectedDate <= today ? selectedDate : today;
+    let processes = [];
+    let report = { rows: [] };
+    let history = { rows: [] };
+
+    try {
+      processes = await loadEmployeeProcesses(user.id);
+      report = await loadWorkReport(user.id, workDate);
+      history = await loadWorkReportHistory(user.id);
+    } catch (error) {
+      window.alert("报工数据加载失败，请确认后端服务已启动。");
+    }
+
+    const hasSavedReport = Boolean(report.rows && report.rows.length);
+    const rows = normalizeReportRows(report.rows || []);
+    const dailyWage = calculateDailyWage(rows);
+    const monthlyWageBase = calculateMonthlyWageBase(history.rows || [], workDate);
+    const monthlyWage = monthlyWageBase + dailyWage;
+
+    app.innerHTML = `
+      <main class="app-page employee-layout">
+        ${renderAppHeader()}
+        <section class="employee-shell">
+          <section class="panel report-panel">
+            <div class="report-date-row">
+              <label for="workDate">日期</label>
+              <input class="input report-date-input" id="workDate" type="date" value="${workDate}" max="${today}" />
+            </div>
+            ${hasSavedReport ? `<p class="report-lock-note">该日期已报工，记录不能再次提交或修改。</p>` : ""}
+            <div class="report-table-wrap">
+              <table class="report-table">
+                <thead>
+                  <tr>
+                    <th>工序</th>
+                    <th>单价</th>
+                    <th>数量</th>
+                    <th>总价</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="reportRows">
+                  ${rows.map((row, index) => renderReportRow(row, index, processes, hasSavedReport)).join("")}
+                </tbody>
+                <tfoot>
+                  <tr>
+                    <td>当日工资</td>
+                    <td colspan="4" id="dailyWage">¥${dailyWage.toFixed(2)}</td>
+                  </tr>
+                  <tr>
+                    <td>当月工资</td>
+                    <td colspan="4" id="monthlyWage">¥${monthlyWage.toFixed(2)}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
           </section>
           <div class="action-row">
-            <button class="button button-success button-large" type="button">提交报工</button>
+            <button class="button button-success button-large" id="saveReportButton" type="button" ${hasSavedReport ? "disabled" : ""}>${hasSavedReport ? "已报工" : "提交报工"}</button>
+            <button class="button button-primary button-large" id="employeeQueryButton" type="button">数据查询</button>
+          </div>
+          <div class="employee-logout-row">
             <button class="button button-secondary button-large" id="logoutButton" type="button">退出登录</button>
           </div>
         </section>
@@ -348,17 +502,875 @@
     `;
 
     bindLogout();
+    document.querySelector("#employeeQueryButton").addEventListener("click", () => navigate("/employee/query"));
+    bindReportTable(processes, user.id, monthlyWageBase, hasSavedReport, history.rows || [], workDate);
   }
 
-  function renderAccountManagement() {
+  async function renderEmployeeHistoryQuery() {
+    const user = requireEmployee();
+    if (!user) return;
+
+    app.innerHTML = `
+      <main class="app-page employee-layout">
+        ${renderAppHeader()}
+        <section class="employee-shell">
+          <section class="panel placeholder-card">
+            <h2>数据加载中</h2>
+          </section>
+        </section>
+      </main>
+    `;
+
+    let history = { rows: [], totalWage: 0 };
+    let processes = [];
+    try {
+      history = await loadWorkReportHistory(user.id);
+      processes = await loadEmployeeProcesses(user.id);
+    } catch (error) {
+      window.alert("历史数据加载失败，请确认后端服务已启动。");
+    }
+
+    const historyRows = normalizeHistoryRows(history.rows || [], processes);
+    const today = getLocalDateString(new Date());
+    const currentMonth = today.slice(0, 7);
+
+    app.innerHTML = `
+      <main class="app-page employee-layout">
+        ${renderAppHeader()}
+        <section class="employee-shell">
+          <section class="panel history-panel employee-query-panel">
+            <div class="history-summary">
+              <span class="history-account-name">${escapeHtml(user.name)}</span>
+            </div>
+            <div class="employee-query-actions">
+              <form class="employee-query-form" id="monthSearchForm" novalidate>
+                <label for="historyStartMonth">按月份查询</label>
+                <div class="date-query-control month-query-control">
+                  <span class="date-query-prefix">起</span>
+                  <span class="date-query-value" data-date-display="historyStartMonth"></span>
+                  <input class="input employee-query-input date-query-input" id="historyStartMonth" name="historyStartMonth" type="month" value="${currentMonth}" />
+                </div>
+                <div class="date-query-control month-query-control">
+                  <span class="date-query-prefix">止</span>
+                  <span class="date-query-value" data-date-display="historyEndMonth"></span>
+                  <input class="input employee-query-input date-query-input" id="historyEndMonth" name="historyEndMonth" type="month" value="${currentMonth}" />
+                </div>
+                <button class="button button-primary button-medium employee-query-button" type="submit">搜索</button>
+              </form>
+              <form class="employee-query-form process-query-form" id="processSearchForm" novalidate>
+                <label for="historyProcess">按工序查询</label>
+                <select class="input employee-query-input select is-placeholder" id="historyProcess" name="historyProcess">
+                  <option value="" disabled selected>工序</option>
+                  ${processes.map((process) => `<option value="${escapeHtml(process.id)}">${escapeHtml(process.name)}</option>`).join("")}
+                </select>
+                <div class="date-query-control process-start-date-control">
+                  <span class="date-query-prefix">起</span>
+                  <span class="date-query-value" data-date-display="processStartDate"></span>
+                  <input class="input employee-query-input date-query-input" id="processStartDate" name="processStartDate" type="date" value="${currentMonth}-01" />
+                </div>
+                <div class="date-query-control process-end-date-control">
+                  <span class="date-query-prefix">止</span>
+                  <span class="date-query-value" data-date-display="processEndDate"></span>
+                  <input class="input employee-query-input date-query-input" id="processEndDate" name="processEndDate" type="date" value="${today}" />
+                </div>
+                <button class="button button-success button-medium employee-query-button" type="submit">搜索</button>
+              </form>
+            </div>
+            <div id="historyResult">
+              ${renderDefaultDailyDetailResult(historyRows)}
+            </div>
+          </section>
+          <div class="action-row">
+            <button class="button button-primary button-large" id="backReportButton" type="button">返回报工</button>
+          </div>
+          <div class="employee-logout-row">
+            <button class="button button-secondary button-large" id="logoutButton" type="button">退出登录</button>
+          </div>
+        </section>
+      </main>
+    `;
+
+    document.querySelector("#backReportButton").addEventListener("click", () => navigate("/employee"));
+    bindSelectPlaceholder("#historyProcess");
+    bindDateDisplayControls();
+    bindEmployeeHistoryQuery(historyRows, processes, today);
+    bindLogout();
+  }
+
+  function normalizeHistoryRows(rows, processes) {
+    return rows.map((row) => {
+      const process = processes.find((item) => item.id === row.processId || item.name === row.processName);
+      return {
+        workDate: row.workDate || row.work_date || "",
+        processId: row.processId || row.process_id || process?.id || "",
+        processName: row.processName || row.process_name || process?.name || "",
+        quantity: Number(row.quantity) || 0,
+        unitPrice: Number(row.unitPrice ?? row.unit_price) || 0,
+        totalPrice: Number(row.totalPrice ?? row.total_price) || 0,
+        confirmStatus: row.confirmStatus || row.confirm_status || "未确认",
+      };
+    });
+  }
+
+  function normalizeAdminHistoryRows(items, processes) {
+    return items.flatMap((item) => {
+      const rows = normalizeHistoryRows(item.history.rows || [], processes);
+      return rows.map((row) => ({
+        ...row,
+        accountId: item.account.id,
+        accountName: item.account.account,
+        employeeName: item.account.name || item.account.account,
+      }));
+    });
+  }
+
+  function bindEmployeeHistoryQuery(historyRows, processes, today) {
+    const result = document.querySelector("#historyResult");
+
+    document.querySelector("#monthSearchForm").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const startMonth = document.querySelector("#historyStartMonth").value;
+      const endMonth = document.querySelector("#historyEndMonth").value;
+      if (!startMonth || !endMonth) {
+        window.alert("请选择开始月份和结束月份。");
+        return;
+      }
+
+      if (startMonth > endMonth) {
+        window.alert("开始月份不能晚于结束月份。");
+        return;
+      }
+
+      result.innerHTML = renderMonthRangeSummaryResult(historyRows, startMonth, endMonth);
+    });
+
+    document.querySelector("#processSearchForm").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const processId = document.querySelector("#historyProcess").value;
+      const startDate = document.querySelector("#processStartDate").value;
+      const endDate = document.querySelector("#processEndDate").value;
+      const process = processes.find((item) => item.id === processId);
+
+      if (!processId || !startDate || !endDate) {
+        window.alert("请选择工序和时间范围。");
+        return;
+      }
+
+      if (startDate > endDate) {
+        window.alert("开始日期不能晚于结束日期。");
+        return;
+      }
+
+      const rows = historyRows.filter((row) => {
+        const sameProcess = row.processId === processId || (!row.processId && row.processName === process?.name);
+        return sameProcess && row.workDate >= startDate && row.workDate <= endDate;
+      });
+
+      result.innerHTML = renderProcessSearchResult(rows, process, startDate, endDate);
+    });
+
+    document.querySelector("#historyResult").addEventListener("click", (event) => {
+      if (event.target.matches("[data-action='date-page']")) {
+        const startDate = event.target.dataset.startDate;
+        const endDate = event.target.dataset.endDate;
+        const page = Number(event.target.dataset.page) || 1;
+        const rows = getDateRangeRows(historyRows, startDate, endDate);
+        result.innerHTML = renderDateDetailResult(rows, startDate, endDate, page);
+        return;
+      }
+
+      if (event.target.matches("[data-action='default-page']")) {
+        const page = Number(event.target.dataset.page) || 1;
+        result.innerHTML = renderDefaultDailyDetailResult(historyRows, page);
+        return;
+      }
+
+      if (!event.target.matches("[data-action='show-default-history']")) return;
+      result.innerHTML = renderDefaultDailyDetailResult(historyRows);
+    });
+  }
+
+  function renderDefaultDailyDetailResult(historyRows, page = 1) {
+    const rows = [...historyRows].sort((left, right) => {
+      const dateOrder = right.workDate.localeCompare(left.workDate);
+      if (dateOrder) return dateOrder;
+      return left.processName.localeCompare(right.processName, "zh-CN");
+    });
+    const pageSize = 15;
+    const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+    const currentPage = Math.min(Math.max(1, page), totalPages);
+    const pageRows = rows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+    const dailyWageMap = getDailyWageMap(rows);
+
+    return `
+      <div class="report-table-wrap">
+        <table class="history-table history-default-detail-table">
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>工序</th>
+              <th>数量</th>
+              <th>工资</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              pageRows.length
+                ? pageRows.map((row, index) => renderDefaultDailyDetailRow(row, pageRows[index - 1], rows[(currentPage - 1) * pageSize + index + 1], dailyWageMap)).join("")
+                : `<tr><td colspan="4" class="history-empty">暂无报工记录</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+      ${renderDefaultPagination(rows.length, currentPage, totalPages)}
+    `;
+  }
+
+  function getDailyWageMap(rows) {
+    const wageMap = new Map();
+    rows.forEach((row) => {
+      wageMap.set(row.workDate, (wageMap.get(row.workDate) || 0) + row.totalPrice);
+    });
+    return wageMap;
+  }
+
+  function renderDefaultDailyDetailRow(row, previousRow, nextRow, dailyWageMap) {
+    const shouldShowDate = !previousRow || previousRow.workDate !== row.workDate;
+    const shouldShowDailyTotal = !nextRow || nextRow.workDate !== row.workDate;
+    const dailyTotal = dailyWageMap.get(row.workDate) || 0;
+
+    return `
+      <tr>
+        <td>${shouldShowDate ? escapeHtml(formatMonthDay(row.workDate)) : ""}</td>
+        <td>${escapeHtml(row.processName)}</td>
+        <td>${row.quantity.toFixed(2)}</td>
+        <td>¥${row.totalPrice.toFixed(2)}</td>
+      </tr>
+      ${
+        shouldShowDailyTotal
+          ? `<tr class="history-day-total-row"><td colspan="4"><span>当天总工资：<strong>¥${dailyTotal.toFixed(2)}</strong></span></td></tr>`
+          : ""
+      }
+    `;
+  }
+
+  function renderDefaultPagination(totalRows, currentPage, totalPages) {
+    if (totalPages <= 1) return "";
+
+    return `
+      <div class="history-pagination">
+        <button class="button button-secondary button-small" data-action="default-page" data-page="${currentPage - 1}" type="button" ${currentPage === 1 ? "disabled" : ""}>上一页</button>
+        <span>${currentPage} / ${totalPages}，共 ${totalRows} 条</span>
+        <button class="button button-secondary button-small" data-action="default-page" data-page="${currentPage + 1}" type="button" ${currentPage === totalPages ? "disabled" : ""}>下一页</button>
+      </div>
+    `;
+  }
+
+  function renderMonthlySummaryTable(historyRows, today) {
+    const summaries = getLast12MonthKeys(today).map((month) => {
+      const rows = historyRows.filter((row) => row.workDate.slice(0, 7) === month);
+      const workDays = new Set(rows.map((row) => row.workDate).filter(Boolean));
+      return {
+        month,
+        wage: rows.reduce((sum, row) => sum + row.totalPrice, 0),
+        workDays: workDays.size,
+      };
+    });
+
+    return `
+      <div class="report-table-wrap">
+        <table class="history-table monthly-summary-table">
+          <thead>
+            <tr>
+              <th>月份</th>
+              <th>工资</th>
+              <th>上班天数</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${summaries.map((summary) => renderMonthlySummaryRow(summary)).join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function renderMonthlySummaryRow(summary) {
+    return `
+      <tr>
+        <td>${escapeHtml(summary.month)}</td>
+        <td>¥${summary.wage.toFixed(2)}</td>
+        <td>${summary.workDays}</td>
+      </tr>
+    `;
+  }
+
+  function renderMonthRangeSummaryResult(historyRows, startMonth, endMonth) {
+    const summaries = getMonthRangeKeys(startMonth, endMonth).reverse().map((month) => {
+      const rows = historyRows.filter((row) => row.workDate.slice(0, 7) === month);
+      const workDays = new Set(rows.map((row) => row.workDate).filter(Boolean));
+      return {
+        month,
+        wage: rows.reduce((sum, row) => sum + row.totalPrice, 0),
+        workDays: workDays.size,
+      };
+    });
+    const totalWage = summaries.reduce((sum, summary) => sum + summary.wage, 0);
+
+    return `
+      ${renderHistoryResultTitle(`${startMonth} 至 ${endMonth} 月工资汇总`)}
+      <div class="history-result-toolbar">
+        <span>总工资：¥${totalWage.toFixed(2)}</span>
+        <button class="button button-secondary button-small" data-action="show-default-history" type="button">默认详情</button>
+      </div>
+      <div class="report-table-wrap">
+        <table class="history-table monthly-summary-table">
+          <thead>
+            <tr>
+              <th>月份</th>
+              <th>工资</th>
+              <th>上班天数</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${summaries.map((summary) => renderMonthlySummaryRow(summary)).join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function getMonthRangeKeys(startMonth, endMonth) {
+    const months = [];
+    const [startYear, startMonthIndex] = startMonth.split("-").map(Number);
+    const [endYear, endMonthIndex] = endMonth.split("-").map(Number);
+    const current = new Date(startYear, startMonthIndex - 1, 1);
+    const end = new Date(endYear, endMonthIndex - 1, 1);
+
+    while (current <= end) {
+      months.push(`${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, "0")}`);
+      current.setMonth(current.getMonth() + 1);
+    }
+
+    return months;
+  }
+
+  function getDateRangeRows(historyRows, startDate, endDate) {
+    return historyRows
+      .filter((row) => row.workDate >= startDate && row.workDate <= endDate)
+      .sort((left, right) => right.workDate.localeCompare(left.workDate));
+  }
+
+  function getLatestWorkDate(rows) {
+    return rows.reduce((latestDate, row) => {
+      if (!row.workDate) return latestDate;
+      return !latestDate || row.workDate > latestDate ? row.workDate : latestDate;
+    }, "");
+  }
+
+  function renderDateDetailResult(rows, startDate, endDate, page = 1) {
+    const pageSize = 10;
+    const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+    const currentPage = Math.min(Math.max(1, page), totalPages);
+    const pageRows = rows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+    const totalWage = rows.reduce((sum, row) => sum + row.totalPrice, 0);
+    return `
+      ${renderHistoryResultTitle(`${startDate} 至 ${endDate} 工资详情`)}
+      <div class="history-result-toolbar">
+        <span>总工资：¥${totalWage.toFixed(2)}</span>
+        <button class="button button-secondary button-small" data-action="show-default-history" type="button">默认详情</button>
+      </div>
+      <div class="report-table-wrap">
+        <table class="history-table history-date-detail-table">
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>工序</th>
+              <th>数量</th>
+              <th>单价</th>
+              <th>工资</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              pageRows.length
+                ? pageRows.map((row) => renderDateRangeDetailRow(row)).join("")
+                : `<tr><td colspan="6" class="history-empty">${escapeHtml(startDate)} 至 ${escapeHtml(endDate)} 暂无报工记录</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+      ${renderDatePagination(rows.length, currentPage, totalPages, startDate, endDate)}
+    `;
+  }
+
+  function renderDateRangeDetailRow(row) {
+    return `
+      <tr>
+        <td>${escapeHtml(row.workDate)}</td>
+        <td>${escapeHtml(row.processName)}</td>
+        <td>${row.quantity.toFixed(2)}</td>
+        <td>¥${row.unitPrice.toFixed(2)}</td>
+        <td>¥${row.totalPrice.toFixed(2)}</td>
+        <td><span class="status-tag status-pending">${escapeHtml(row.confirmStatus)}</span></td>
+      </tr>
+    `;
+  }
+
+  function renderDatePagination(totalRows, currentPage, totalPages, startDate, endDate) {
+    if (totalPages <= 1) return "";
+
+    return `
+      <div class="history-pagination">
+        <button class="button button-secondary button-small" data-action="date-page" data-start-date="${escapeHtml(startDate)}" data-end-date="${escapeHtml(endDate)}" data-page="${currentPage - 1}" type="button" ${currentPage === 1 ? "disabled" : ""}>上一页</button>
+        <span>${currentPage} / ${totalPages}，共 ${totalRows} 条</span>
+        <button class="button button-secondary button-small" data-action="date-page" data-start-date="${escapeHtml(startDate)}" data-end-date="${escapeHtml(endDate)}" data-page="${currentPage + 1}" type="button" ${currentPage === totalPages ? "disabled" : ""}>下一页</button>
+      </div>
+    `;
+  }
+
+  function renderProcessSearchResult(rows, process, startDate, endDate) {
+    const totalQuantity = rows.reduce((sum, row) => sum + row.quantity, 0);
+    const totalWage = rows.reduce((sum, row) => sum + row.totalPrice, 0);
+    const workDays = new Set(rows.map((row) => row.workDate).filter(Boolean)).size;
+
+    return `
+      ${renderProcessHistoryTitle(`${process ? process.name : "工序"} 统计`, `${startDate} 至 ${endDate}`)}
+      <div class="history-stat-grid">
+        <div><span>总数量</span><strong>${totalQuantity.toFixed(2)}</strong></div>
+        <div><span>总工资</span><strong>¥${totalWage.toFixed(2)}</strong></div>
+        <div><span>报工天数</span><strong>${workDays}</strong></div>
+      </div>
+      <div class="history-result-toolbar">
+        <span>明细记录</span>
+        <button class="button button-secondary button-small" data-action="show-default-history" type="button">默认详情</button>
+      </div>
+      <div class="report-table-wrap">
+        <table class="history-table history-detail-table">
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>数量</th>
+              <th>单价</th>
+              <th>工资</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              rows.length
+                ? rows.map((row) => renderHistoryDetailRow(row, true)).join("")
+                : `<tr><td colspan="5" class="history-empty">这个时间段暂无该工序记录</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function renderHistoryResultTitle(title) {
+    return `<div class="history-result-title">${escapeHtml(title)}</div>`;
+  }
+
+  function renderProcessHistoryTitle(title, dateRange) {
+    return `
+      <div class="history-result-title process-history-title">
+        <span>${escapeHtml(title)}</span>
+        <span>${escapeHtml(dateRange)}</span>
+      </div>
+    `;
+  }
+
+  function renderHistoryDetailRow(row, showDate) {
+    return `
+      <tr>
+        <td>${escapeHtml(showDate ? row.workDate : row.processName)}</td>
+        <td>${row.quantity.toFixed(2)}</td>
+        <td>¥${row.unitPrice.toFixed(2)}</td>
+        <td>¥${row.totalPrice.toFixed(2)}</td>
+        <td><span class="status-tag status-pending">${escapeHtml(row.confirmStatus)}</span></td>
+      </tr>
+    `;
+  }
+
+  function getLocalDateString(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function getDateOffsetString(date, offsetDays) {
+    const nextDate = new Date(date);
+    nextDate.setDate(nextDate.getDate() + offsetDays);
+    return getLocalDateString(nextDate);
+  }
+
+  function getLast12MonthKeys(today) {
+    const [year, month] = today.slice(0, 7).split("-").map(Number);
+    return Array.from({ length: 12 }, (_, index) => {
+      const date = new Date(year, month - 1 - index, 1);
+      return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+    });
+  }
+
+  function normalizeReportRows(savedRows) {
+    const filledRows = savedRows.map((row) => ({
+      processId: row.processId || "",
+      processName: row.processName || "",
+      unitPrice: Number(row.unitPrice) || 0,
+      quantity: row.quantity ? String(row.quantity) : "",
+    }));
+
+    return ensureReportRowRules(filledRows);
+  }
+
+  function ensureReportRowRules(rows) {
+    const nextRows = rows.slice();
+    const blankCount = nextRows.filter((row) => !row.processId && !row.quantity).length;
+
+    for (let index = blankCount; index < 2; index += 1) {
+      nextRows.push({ processId: "", processName: "", unitPrice: 0, quantity: "" });
+    }
+
+    while (nextRows.length < 5) {
+      nextRows.push({ processId: "", processName: "", unitPrice: 0, quantity: "" });
+    }
+
+    return nextRows;
+  }
+
+  function renderReportRow(row, index, processes, readonly = false) {
+    const selectedProcess = processes.find((process) => process.id === row.processId);
+    const processName = selectedProcess ? selectedProcess.name : row.processName || "";
+    const unitPrice = selectedProcess ? Number(selectedProcess.price) : Number(row.unitPrice) || 0;
+    const quantity = Number(row.quantity) || 0;
+    const totalPrice = unitPrice * quantity;
+
+    return `
+      <tr data-report-row="${index}">
+        <td>
+          <div class="report-process-control">
+            <input class="report-input report-process-input" data-field="processName" value="${escapeHtml(processName)}" placeholder="工序" autocomplete="off" inputmode="none" readonly aria-label="工序" />
+            <button class="report-process-picker" data-action="open-process-options" type="button" aria-label="显示工序选项" ${readonly ? "disabled" : ""}></button>
+            <input data-field="processId" type="hidden" value="${escapeHtml(row.processId)}" />
+            <div class="report-process-menu" data-process-menu>
+              ${processes.map((process) => `<button class="report-process-option" data-action="select-process-option" data-process-name="${escapeHtml(process.name)}" type="button">${escapeHtml(process.name)}</button>`).join("")}
+            </div>
+          </div>
+        </td>
+        <td>
+          <input class="report-input report-price-input" data-field="unitPrice" value="${unitPrice ? `¥${unitPrice.toFixed(2)}` : ""}" readonly aria-label="单价" />
+        </td>
+        <td>
+          <input class="report-input report-quantity-input" data-field="quantity" type="number" min="0" step="0.01" value="${escapeHtml(row.quantity)}" aria-label="数量" ${readonly ? "readonly" : ""} />
+        </td>
+        <td>
+          <input class="report-input report-total-input" data-field="totalPrice" value="${totalPrice ? `¥${totalPrice.toFixed(2)}` : ""}" readonly aria-label="总价" />
+        </td>
+        <td>
+          <button class="report-delete-button" data-action="delete-report-row" type="button" aria-label="删除本行" ${readonly ? "disabled" : ""}>删除</button>
+        </td>
+      </tr>
+    `;
+  }
+
+  function readReportRowsFromDom(processes) {
+    return Array.from(document.querySelectorAll("[data-report-row]")).map((rowElement) => {
+      const processInput = rowElement.querySelector("[data-field='processName']");
+      const quantity = rowElement.querySelector("[data-field='quantity']").value;
+      const processName = processInput.value.trim();
+      const process = processes.find((item) => item.name === processName);
+      return {
+        processId: process ? process.id : "",
+        processName,
+        unitPrice: process ? Number(process.price) : 0,
+        quantity,
+      };
+    });
+  }
+
+  function calculateDailyWage(rows) {
+    return rows.reduce((sum, row) => sum + (Number(row.unitPrice) || 0) * (Number(row.quantity) || 0), 0);
+  }
+
+  function calculateMonthlyWageBase(historyRows, selectedDate) {
+    const selectedMonth = selectedDate.slice(0, 7);
+    return historyRows
+      .filter((row) => row.workDate && row.workDate.slice(0, 7) === selectedMonth && row.workDate !== selectedDate)
+      .reduce((sum, row) => sum + (Number(row.totalPrice) || 0), 0);
+  }
+
+  function getDuplicateReportProcessName(rows) {
+    const seenProcessIds = new Set();
+    for (const row of rows) {
+      if (!row.processId) continue;
+      if (seenProcessIds.has(row.processId)) return row.processName || "同一工序";
+      seenProcessIds.add(row.processId);
+    }
+
+    return "";
+  }
+
+  function refreshReportTable(processes, monthlyWageBase) {
+    const rows = ensureReportRowRules(readReportRowsFromDom(processes));
+    document.querySelector("#reportRows").innerHTML = rows.map((row, index) => renderReportRow(row, index, processes)).join("");
+    refreshReportSummary(processes, monthlyWageBase);
+    bindReportRowEvents(processes, monthlyWageBase);
+  }
+
+  function appendReportBlankRowsIfNeeded(processes, monthlyWageBase) {
+    const rows = readReportRowsFromDom(processes);
+    const blankCount = rows.filter((row) => !row.processName && !row.quantity).length;
+    if (blankCount >= 2) return;
+
+    const reportRows = document.querySelector("#reportRows");
+    const startIndex = rows.length;
+    const rowsToAdd = Array.from({ length: 2 - blankCount }, () => ({
+      processId: "",
+      processName: "",
+      unitPrice: 0,
+      quantity: "",
+    }));
+
+    reportRows.insertAdjacentHTML(
+      "beforeend",
+      rowsToAdd.map((row, index) => renderReportRow(row, startIndex + index, processes)).join("")
+    );
+    bindReportRowEvents(processes, monthlyWageBase);
+  }
+
+  function refreshSingleReportRow(rowElement, processes, monthlyWageBase) {
+    const processName = rowElement.querySelector("[data-field='processName']").value.trim();
+    const process = processes.find((item) => item.name === processName);
+    const quantity = Number(rowElement.querySelector("[data-field='quantity']").value) || 0;
+    const unitPrice = process ? Number(process.price) : 0;
+    const totalPrice = unitPrice * quantity;
+
+    rowElement.querySelector("[data-field='processId']").value = process ? process.id : "";
+    rowElement.querySelector("[data-field='unitPrice']").value = unitPrice ? `¥${unitPrice.toFixed(2)}` : "";
+    rowElement.querySelector("[data-field='totalPrice']").value = totalPrice ? `¥${totalPrice.toFixed(2)}` : "";
+    refreshReportSummary(processes, monthlyWageBase);
+  }
+
+  function closeProcessMenus() {
+    document.querySelectorAll(".report-process-control.is-open").forEach((control) => {
+      control.classList.remove("is-open");
+    });
+  }
+
+  function filterProcessMenu(rowElement) {
+    rowElement.querySelectorAll(".report-process-option").forEach((option) => {
+      option.hidden = false;
+    });
+  }
+
+  function refreshReportSummary(processes, monthlyWageBase) {
+    const rows = readReportRowsFromDom(processes);
+    const dailyWage = calculateDailyWage(rows);
+    document.querySelector("#dailyWage").textContent = `¥${dailyWage.toFixed(2)}`;
+    document.querySelector("#monthlyWage").textContent = `¥${(monthlyWageBase + dailyWage).toFixed(2)}`;
+  }
+
+  function bindReportRowEvents(processes, monthlyWageBase) {
+    document.querySelectorAll(".report-quantity-input").forEach((input) => {
+      if (input.dataset.reportBound) return;
+      input.dataset.reportBound = "true";
+      input.addEventListener("change", () => {
+        refreshSingleReportRow(input.closest("[data-report-row]"), processes, monthlyWageBase);
+        appendReportBlankRowsIfNeeded(processes, monthlyWageBase);
+      });
+      input.addEventListener("input", () => {
+        refreshSingleReportRow(input.closest("[data-report-row]"), processes, monthlyWageBase);
+        appendReportBlankRowsIfNeeded(processes, monthlyWageBase);
+      });
+    });
+    document.querySelectorAll(".report-process-input").forEach((input) => {
+      if (input.dataset.reportBound) return;
+      input.dataset.reportBound = "true";
+      input.addEventListener("click", () => {
+        const rowElement = input.closest("[data-report-row]");
+        const control = rowElement?.querySelector(".report-process-control");
+        if (!control) return;
+
+        const shouldOpen = !control.classList.contains("is-open");
+        closeProcessMenus();
+        filterProcessMenu(rowElement);
+        control.classList.toggle("is-open", shouldOpen);
+      });
+    });
+    document.querySelectorAll("[data-action='delete-report-row']").forEach((button) => {
+      if (button.dataset.reportBound) return;
+      button.dataset.reportBound = "true";
+      button.addEventListener("click", () => {
+        const rowElement = button.closest("[data-report-row]");
+        if (!rowElement) return;
+        rowElement.remove();
+        refreshReportTable(processes, monthlyWageBase);
+      });
+    });
+    document.querySelectorAll("[data-action='open-process-options']").forEach((button) => {
+      if (button.dataset.reportBound) return;
+      button.dataset.reportBound = "true";
+      button.addEventListener("click", () => {
+        const rowElement = button.closest("[data-report-row]");
+        const control = rowElement?.querySelector(".report-process-control");
+        const processInput = rowElement?.querySelector("[data-field='processName']");
+        if (!control || !processInput) return;
+
+        const shouldOpen = !control.classList.contains("is-open");
+        closeProcessMenus();
+        processInput.blur();
+        filterProcessMenu(rowElement);
+        control.classList.toggle("is-open", shouldOpen);
+      });
+    });
+    document.querySelectorAll("[data-action='select-process-option']").forEach((button) => {
+      if (button.dataset.reportBound) return;
+      button.dataset.reportBound = "true";
+      button.addEventListener("click", () => {
+        const rowElement = button.closest("[data-report-row]");
+        const processInput = rowElement.querySelector("[data-field='processName']");
+        processInput.value = button.dataset.processName;
+        refreshSingleReportRow(rowElement, processes, monthlyWageBase);
+        appendReportBlankRowsIfNeeded(processes, monthlyWageBase);
+        closeProcessMenus();
+      });
+    });
+  }
+
+  function getPreviousReportedDate(historyRows, currentDate) {
+    const reportDates = Array.from(
+      new Set(
+        historyRows
+          .map((row) => row.workDate || row.work_date || "")
+          .filter((workDate) => workDate && workDate < currentDate)
+      )
+    ).sort((left, right) => right.localeCompare(left));
+
+    return reportDates[0] || "";
+  }
+
+  function bindReportSwipe(historyRows, workDate) {
+    const tableWrap = document.querySelector(".report-table-wrap");
+    if (!tableWrap) return;
+
+    let startX = null;
+    let startY = null;
+
+    tableWrap.addEventListener(
+      "touchstart",
+      (event) => {
+        const touch = event.touches[0];
+        if (!touch) return;
+        startX = touch.clientX;
+        startY = touch.clientY;
+      },
+      { passive: true }
+    );
+
+    tableWrap.addEventListener(
+      "touchend",
+      (event) => {
+        const touch = event.changedTouches[0];
+        if (!touch || startX === null || startY === null) return;
+
+        const deltaX = touch.clientX - startX;
+        const deltaY = touch.clientY - startY;
+        startX = null;
+        startY = null;
+
+        if (deltaX < 70 || Math.abs(deltaY) > 60 || deltaX < Math.abs(deltaY) * 1.4) return;
+
+        const previousDate = getPreviousReportedDate(historyRows, workDate);
+        if (previousDate) {
+          renderEmployeeWorkReport(previousDate);
+        }
+      },
+      { passive: true }
+    );
+  }
+
+  function bindReportTable(processes, accountId, monthlyWageBase, hasSavedReport, historyRows, workDate) {
+    bindReportSwipe(historyRows, workDate);
+    if (!hasSavedReport) {
+      bindReportRowEvents(processes, monthlyWageBase);
+    }
+    document.querySelector("#workDate").addEventListener("change", (event) => {
+      const selectedDate = event.target.value;
+      const today = getLocalDateString(new Date());
+      if (selectedDate > today) {
+        window.alert("不能提前报工，只能选择今天或过去日期。");
+        renderEmployeeWorkReport(today);
+        return;
+      }
+      renderEmployeeWorkReport(selectedDate);
+    });
+    document.querySelector("#saveReportButton").addEventListener("click", async () => {
+      const workDate = document.querySelector("#workDate").value;
+      const today = getLocalDateString(new Date());
+      if (workDate > today) {
+        window.alert("不能提前报工，只能选择今天或过去日期。");
+        return;
+      }
+      if (hasSavedReport) {
+        window.alert("该日期已报工，记录不能再次提交或修改。");
+        return;
+      }
+
+      const validRows = readReportRowsFromDom(processes).filter((row) => row.processId && Number(row.quantity) > 0);
+      if (!validRows.length) {
+        window.alert("请至少填写一条报工记录。");
+        return;
+      }
+
+      const duplicateProcessName = getDuplicateReportProcessName(validRows);
+      if (duplicateProcessName) {
+        window.alert(`同一天同一个工序只能报一次：${duplicateProcessName}`);
+        return;
+      }
+
+      const rows = validRows.map((row) => ({ process_id: row.processId, quantity: Number(row.quantity) }));
+
+      try {
+        await saveWorkReport(accountId, workDate, rows);
+        window.alert("报工已保存。");
+        renderEmployeeWorkReport(workDate);
+      } catch (error) {
+        window.alert(error.message || "报工保存失败，请稍后再试。");
+      }
+    });
+  }
+
+  async function renderAccountManagement() {
     const user = requireAdmin();
     if (!user) return;
 
-    const data = readData();
+    let data = readData();
+    app.innerHTML = `
+      <main class="app-page admin-layout">
+        ${renderAppHeader()}
+        <section class="admin-shell">
+          <section class="admin-main admin-management-grid">
+            <section class="admin-section empty-section">
+              <h2>账号列表加载中</h2>
+            </section>
+          </section>
+          ${renderAdminFooter("/admin/processes", "工序管理")}
+        </section>
+      </main>
+    `;
+    bindAdminNavigation();
+
+    data = await loadSharedAccounts(data);
+    data = await loadSharedProcesses(data);
+    latestAdminData = data;
     const visibleAccounts = getVisibleAccounts(data, user);
+    const processesForAccountConfig = data.processes.filter((process) => process.status === "active");
     const creatableRoles = isSuperAdmin(user)
       ? roleOptions
-      : roleOptions.filter((role) => ["admin", "employee"].includes(role.value));
+      : roleOptions.filter((role) => role.value === "employee");
 
     app.innerHTML = `
       <main class="app-page admin-layout">
@@ -368,7 +1380,7 @@
             <section class="admin-section">
               <div class="section-heading account-create-heading">
                 <div>
-                  <h2 class="account-create-title">增加账号</h2>
+                  <h2 class="account-create-title">新增账号</h2>
                 </div>
               </div>
               <form class="admin-form account-create-form" id="accountForm" novalidate>
@@ -384,6 +1396,16 @@
                     ${creatableRoles.map((role) => `<option value="${role.value}">${role.label}</option>`).join("")}
                   </select>
                 </div>
+                <div class="field account-process-field">
+                  <div class="account-process-checklist" id="newAccountProcesses" role="group" aria-label="可报工工序">
+                    <p class="account-process-title">工序配置</p>
+                    ${
+                      processesForAccountConfig.length
+                        ? processesForAccountConfig.map((process) => renderProcessCheckbox(process)).join("")
+                        : `<p class="account-process-empty">暂无工序，请先新增工序</p>`
+                    }
+                  </div>
+                </div>
                 <button class="button button-primary button-medium" type="submit">新增账号</button>
                 <p class="error-message" id="accountError"></p>
               </form>
@@ -395,11 +1417,13 @@
                 </div>
               </div>
               <div class="table-wrap account-table-wrap">
-                <table class="data-table account-table">
+                <table class="data-table account-table account-management-table">
                   <thead>
                     <tr>
                       <th>账号</th>
                       <th>密码</th>
+                      <th>工序</th>
+                      <th>权限</th>
                       <th>状态</th>
                       <th>操作</th>
                     </tr>
@@ -425,6 +1449,9 @@
     document.querySelectorAll("[data-action='change-password']").forEach((button) => {
       button.addEventListener("click", () => handleChangeAccountPassword(button.dataset.id));
     });
+    document.querySelectorAll("[data-action='manage-account-processes']").forEach((button) => {
+      button.addEventListener("click", () => openAccountProcessEditor(button.dataset.id));
+    });
     document.querySelectorAll("[data-action='change-account-name']").forEach((button) => {
       button.addEventListener("click", () => handleChangeAccountName(button.dataset.id));
     });
@@ -449,6 +1476,12 @@
           <span class="account-password">${escapeHtml(account.password)}</span>
           <button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-password" data-id="${account.id}" type="button">修改</button>
         </td>
+        <td class="account-process-cell">
+          <button class="button button-primary button-small account-process-button" data-action="manage-account-processes" data-id="${account.id}" type="button">工序</button>
+        </td>
+        <td class="account-role-cell">
+          <button class="button button-secondary button-small account-role-button" type="button" disabled>${escapeHtml(getRoleLabel(account.role))}</button>
+        </td>
         <td class="account-status-cell">
           <button class="button ${statusClass} button-small account-status-button" data-action="toggle-account-status" data-id="${account.id}" type="button" ${account.id === user.id ? "disabled" : ""}>${account.status === "active" ? "启用" : "停用"}</button>
         </td>
@@ -459,14 +1492,108 @@
     `;
   }
 
-  function handleCreateAccount(event, user) {
+  function openAccountProcessEditor(accountId) {
+    const data = getLatestAdminData();
+    const account = data.accounts.find((item) => item.id === accountId);
+    if (!account) return;
+
+    const activeProcesses = data.processes.filter((process) => process.status === "active");
+    const selectedProcessIds = new Set(account.processIds || []);
+    const existingModal = document.querySelector("#accountProcessModal");
+    if (existingModal) existingModal.remove();
+
+    app.insertAdjacentHTML(
+      "beforeend",
+      `
+        <div class="account-process-modal" id="accountProcessModal" role="dialog" aria-modal="true" aria-label="账号工序配置">
+          <div class="account-process-dialog">
+            <div class="account-process-dialog-heading">
+              <strong>${escapeHtml(account.account)}</strong>
+              <button class="account-process-close" data-action="close-account-processes" type="button" aria-label="关闭">×</button>
+            </div>
+            <div class="account-process-dialog-list" role="group" aria-label="账号可报工工序">
+              <p class="account-process-title">工序配置</p>
+              ${
+                activeProcesses.length
+                  ? activeProcesses.map((process) => renderAccountProcessEditorOption(process, selectedProcessIds.has(process.id))).join("")
+                  : `<p class="account-process-empty">暂无启用工序</p>`
+              }
+            </div>
+            <p class="error-message" id="accountProcessError"></p>
+            <div class="account-process-dialog-actions">
+              <button class="button button-secondary button-medium" data-action="close-account-processes" type="button">取消</button>
+              <button class="button button-primary button-medium" data-action="save-account-processes" data-id="${account.id}" type="button">保存</button>
+            </div>
+          </div>
+        </div>
+      `
+    );
+
+    document.querySelectorAll("[data-action='close-account-processes']").forEach((button) => {
+      button.addEventListener("click", closeAccountProcessEditor);
+    });
+    document.querySelector("[data-action='save-account-processes']").addEventListener("click", () => handleSaveAccountProcesses(account.id));
+  }
+
+  function renderAccountProcessEditorOption(process, isChecked) {
+    const processName = String(process.name || "");
+    const spanClass = getProcessOptionSpanClass(processName);
+    return `
+      <label class="account-process-option ${spanClass}">
+        <input class="account-process-checkbox" type="checkbox" name="editProcessIds" value="${escapeHtml(process.id)}" ${isChecked ? "checked" : ""} />
+        <span>${escapeHtml(processName)}</span>
+      </label>
+    `;
+  }
+
+  function closeAccountProcessEditor() {
+    document.querySelector("#accountProcessModal")?.remove();
+  }
+
+  async function handleSaveAccountProcesses(accountId) {
+    const error = document.querySelector("#accountProcessError");
+    const processIds = Array.from(document.querySelectorAll("input[name='editProcessIds']:checked")).map((input) => input.value);
+
+    if (!processIds.length) {
+      showInlineError(error, "请至少保留一个可报工工序。");
+      return;
+    }
+
+    try {
+      await updateSharedAccount(accountId, { process_ids: processIds });
+      closeAccountProcessEditor();
+      renderAccountManagement();
+    } catch (saveError) {
+      showInlineError(error, "工序配置保存失败，请稍后再试。");
+    }
+  }
+
+  function renderProcessCheckbox(process) {
+    const processName = String(process.name || "");
+    const spanClass = getProcessOptionSpanClass(processName);
+    return `
+      <label class="account-process-option ${spanClass}">
+        <input class="account-process-checkbox" type="checkbox" name="processIds" value="${escapeHtml(process.id)}" />
+        <span>${escapeHtml(processName)}</span>
+      </label>
+    `;
+  }
+
+  function getProcessOptionSpanClass(processName) {
+    if (processName.length >= 8) return "is-extra-wide";
+    if (processName.length > 4) return "is-wide";
+    return "";
+  }
+
+  async function handleCreateAccount(event, user) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const accountName = String(form.get("account") || "").trim();
     const password = String(form.get("password") || "").trim();
     const role = String(form.get("role") || "");
+    const processIds = Array.from(document.querySelectorAll("input[name='processIds']:checked")).map((input) => input.value);
     const error = document.querySelector("#accountError");
-    const data = readData();
+    const data = getLatestAdminData();
 
     if (!accountName || !password) {
       showInlineError(error, "账号名称和密码都需要填写。");
@@ -478,8 +1605,13 @@
       return;
     }
 
-    if (!isSuperAdmin(user) && !["admin", "employee"].includes(role)) {
-      showInlineError(error, "管理员只能新增管理员和员工账号。");
+    if (!processIds.length) {
+      showInlineError(error, "请给账号配置至少一个可报工工序。");
+      return;
+    }
+
+    if (!isSuperAdmin(user) && role !== "employee") {
+      showInlineError(error, "管理员只能新增员工账号。");
       return;
     }
 
@@ -488,7 +1620,7 @@
       return;
     }
 
-    data.accounts.push({
+    const account = {
       id: `u-${Date.now()}`,
       account: accountName,
       password,
@@ -496,37 +1628,60 @@
       name: accountName,
       status: "active",
       managerId: !isSuperAdmin(user) ? user.id : null,
-    });
-    writeData(data);
-    renderAccountManagement();
+      processIds,
+    };
+
+    try {
+      await createSharedAccount({
+        account: accountName,
+        password,
+        role,
+        name: accountName,
+        status: "active",
+        manager_id: account.managerId,
+        process_ids: processIds,
+      });
+      renderAccountManagement();
+    } catch (saveError) {
+      showInlineError(error, "账号名称已存在，或后端保存失败。");
+    }
   }
 
-  function handleDeleteAccount(accountId) {
+  async function handleDeleteAccount(accountId) {
     const user = getCurrentUser();
     if (!user || accountId === user.id) return;
     if (!window.confirm("确定删除这个账号吗？删除后账号列表中不再显示。")) return;
 
-    const data = readData();
-    data.accounts = data.accounts.filter((account) => account.id !== accountId);
-    writeData(data);
-    renderAccountManagement();
+    const data = getLatestAdminData();
+
+    try {
+      await deleteSharedAccount(accountId);
+      renderAccountManagement();
+    } catch (error) {
+      window.alert("后端删除失败，请稍后再试。");
+    }
   }
 
-  function handleChangeAccountPassword(accountId) {
-    const data = readData();
+  async function handleChangeAccountPassword(accountId) {
+    const data = getLatestAdminData();
     const account = data.accounts.find((item) => item.id === accountId);
     if (!account) return;
 
     const password = window.prompt("请输入新的账号密码", account.password);
     if (!password || !password.trim()) return;
 
-    account.password = password.trim();
-    writeData(data);
-    renderAccountManagement();
+    const nextPassword = password.trim();
+
+    try {
+      await updateSharedAccount(accountId, { password: nextPassword });
+      renderAccountManagement();
+    } catch (error) {
+      window.alert("后端保存失败，请稍后再试。");
+    }
   }
 
-  function handleChangeAccountName(accountId) {
-    const data = readData();
+  async function handleChangeAccountName(accountId) {
+    const data = getLatestAdminData();
     const account = data.accounts.find((item) => item.id === accountId);
     if (!account) return;
 
@@ -539,17 +1694,19 @@
       return;
     }
 
-    account.account = nextName;
-    account.name = nextName;
-    writeData(data);
-    renderAccountManagement();
+    try {
+      await updateSharedAccount(accountId, { account: nextName, name: nextName });
+      renderAccountManagement();
+    } catch (error) {
+      window.alert("账号名称已存在，或后端保存失败。");
+    }
   }
 
-  function handleToggleAccountStatus(accountId) {
+  async function handleToggleAccountStatus(accountId) {
     const user = getCurrentUser();
     if (!user || accountId === user.id) return;
 
-    const data = readData();
+    const data = getLatestAdminData();
     const account = data.accounts.find((item) => item.id === accountId);
     if (!account) return;
 
@@ -557,9 +1714,12 @@
     const actionText = nextStatus === "active" ? "启用" : "停用";
     if (!window.confirm(`确定${actionText}这个账号吗？`)) return;
 
-    account.status = nextStatus;
-    writeData(data);
-    renderAccountManagement();
+    try {
+      await updateSharedAccount(accountId, { status: nextStatus });
+      renderAccountManagement();
+    } catch (error) {
+      window.alert("后端保存失败，请稍后再试。");
+    }
   }
 
   async function renderProcessManagement() {
@@ -583,6 +1743,7 @@
     bindAdminNavigation();
 
     data = await loadSharedProcesses(data);
+    latestAdminData = data;
     const canDeleteProcess = isSuperAdmin(user);
     const totalProcessPages = Math.max(1, Math.ceil(data.processes.length / PROCESS_PAGE_SIZE));
     currentProcessPage = Math.min(currentProcessPage, totalProcessPages);
@@ -722,7 +1883,7 @@
     const price = Number(form.get("price"));
     const unit = String(form.get("unit") || "");
     const error = document.querySelector("#processError");
-    const data = readData();
+    const data = getLatestAdminData();
 
     if (!name || Number.isNaN(price) || price < 0 || !unit) {
       showInlineError(error, "请填写工序名称、正确的当前单价并选择单位。");
@@ -743,10 +1904,7 @@
     };
 
     try {
-      if (!(await createSharedProcess({ name, price, unit }))) {
-        data.processes.push(process);
-        writeData(data);
-      }
+      await createSharedProcess({ name, price, unit });
       renderProcessManagement();
     } catch (saveError) {
       showInlineError(error, "工序名称已存在，或后端保存失败。");
@@ -754,7 +1912,7 @@
   }
 
   async function handleRenameProcess(processId) {
-    const data = readData();
+    const data = getLatestAdminData();
     const process = data.processes.find((item) => item.id === processId);
     if (!process) return;
 
@@ -764,10 +1922,7 @@
     const nextName = name.trim();
 
     try {
-      if (!(await updateSharedProcess(processId, { name: nextName }))) {
-        process.name = nextName;
-        writeData(data);
-      }
+      await updateSharedProcess(processId, { name: nextName });
       renderProcessManagement();
     } catch (error) {
       window.alert("工序名称已存在，或后端保存失败。");
@@ -775,7 +1930,7 @@
   }
 
   async function handleChangeProcessPrice(processId) {
-    const data = readData();
+    const data = getLatestAdminData();
     const process = data.processes.find((item) => item.id === processId);
     if (!process) return;
 
@@ -789,10 +1944,7 @@
     }
 
     try {
-      if (!(await updateSharedProcess(processId, { price }))) {
-        process.price = price;
-        writeData(data);
-      }
+      await updateSharedProcess(processId, { price });
       renderProcessManagement();
     } catch (error) {
       window.alert("后端保存失败，请稍后再试。");
@@ -800,7 +1952,7 @@
   }
 
   async function handleToggleProcessStatus(processId) {
-    const data = readData();
+    const data = getLatestAdminData();
     const process = data.processes.find((item) => item.id === processId);
     if (!process) return;
 
@@ -809,10 +1961,7 @@
     if (!window.confirm(`确定${actionText}这个工序吗？`)) return;
 
     try {
-      if (!(await updateSharedProcess(processId, { status: nextStatus }))) {
-        process.status = nextStatus;
-        writeData(data);
-      }
+      await updateSharedProcess(processId, { status: nextStatus });
       renderProcessManagement();
     } catch (error) {
       window.alert("后端保存失败，请稍后再试。");
@@ -824,20 +1973,17 @@
     if (!user || !isSuperAdmin(user)) return;
     if (!window.confirm("确定删除这个工序吗？删除后工序列表中不再显示。")) return;
 
-    const data = readData();
+    const data = getLatestAdminData();
 
     try {
-      if (!(await deleteSharedProcess(processId))) {
-        data.processes = data.processes.filter((process) => process.id !== processId);
-        writeData(data);
-      }
+      await deleteSharedProcess(processId);
       renderProcessManagement();
     } catch (error) {
       window.alert("后端删除失败，请稍后再试。");
     }
   }
 
-  function renderAdminQueryPlaceholder() {
+  async function renderAdminQuery() {
     const user = requireAdmin();
     if (!user) return;
 
@@ -847,8 +1993,7 @@
         <section class="admin-shell">
           <section class="admin-main">
             <section class="admin-section empty-section">
-              <h2>数据查询页面待开发</h2>
-              <p class="page-subtitle">账号管理页已提供跳转入口，下一步可接入按员工、日期、月份和工序查询。</p>
+              <h2>数据查询加载中</h2>
             </section>
           </section>
           ${renderAdminFooter("/admin/processes", "工序管理")}
@@ -857,6 +2002,250 @@
     `;
 
     bindAdminNavigation();
+
+    let data = readData();
+    data = await loadSharedAccounts(data);
+    data = await loadSharedProcesses(data);
+    latestAdminData = data;
+
+    const visibleEmployees = getVisibleAccounts(data, user).filter((account) => account.role === "employee");
+    const histories = await Promise.all(
+      visibleEmployees.map(async (account) => {
+        try {
+          return { account, history: await loadWorkReportHistory(account.id) };
+        } catch (error) {
+          return { account, history: { rows: [] } };
+        }
+      })
+    );
+    const historyRows = normalizeAdminHistoryRows(histories, data.processes);
+    const latestWorkDate = getLatestWorkDate(historyRows) || getLocalDateString(new Date());
+    const defaultRows = historyRows.filter((row) => row.workDate === latestWorkDate);
+
+    app.innerHTML = `
+      <main class="app-page admin-layout">
+        ${renderAppHeader()}
+        <section class="admin-shell">
+          <section class="admin-main admin-query-main">
+            <section class="admin-section admin-query-section">
+              <div class="section-heading admin-query-heading">
+                <div>
+                  <h2 class="admin-query-title">数据查询</h2>
+                </div>
+              </div>
+              <form class="admin-query-form" id="adminQueryForm" novalidate>
+                <div class="field">
+                  <label for="adminQueryEmployee">员工</label>
+                  <select class="input select" id="adminQueryEmployee" name="employeeId">
+                    <option value="">全部员工</option>
+                    ${visibleEmployees
+                      .map((account) => `<option value="${escapeHtml(account.id)}">${escapeHtml(account.account)}</option>`)
+                      .join("")}
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="adminQueryStartDate">开始日期</label>
+                  <input class="input" id="adminQueryStartDate" name="startDate" type="date" value="${escapeHtml(latestWorkDate)}" />
+                </div>
+                <div class="field">
+                  <label for="adminQueryEndDate">结束日期</label>
+                  <input class="input" id="adminQueryEndDate" name="endDate" type="date" value="${escapeHtml(latestWorkDate)}" />
+                </div>
+                <div class="field">
+                  <label for="adminQueryProcess">工序</label>
+                  <select class="input select" id="adminQueryProcess" name="processId">
+                    <option value="">全部工序</option>
+                    ${data.processes
+                      .map((process) => `<option value="${escapeHtml(process.id)}">${escapeHtml(process.name)}</option>`)
+                      .join("")}
+                  </select>
+                </div>
+                <button class="button button-primary button-medium admin-query-submit" type="submit">查询</button>
+              </form>
+            </section>
+            <section class="admin-section admin-query-section">
+              <div id="adminQueryResult">
+                ${renderAdminQueryResult(defaultRows, `${latestWorkDate} 至 ${latestWorkDate}`)}
+              </div>
+            </section>
+          </section>
+          ${renderAdminFooter("/admin/processes", "工序管理")}
+        </section>
+      </main>
+    `;
+
+    bindAdminNavigation();
+    bindAdminQueryForm(historyRows, data.processes, latestWorkDate);
+  }
+
+  function bindAdminQueryForm(historyRows, processes, latestWorkDate) {
+    const form = document.querySelector("#adminQueryForm");
+    const result = document.querySelector("#adminQueryResult");
+    if (!form || !result) return;
+
+    let currentRows = historyRows.filter((row) => row.workDate === latestWorkDate);
+    let currentTitle = `${latestWorkDate} 至 ${latestWorkDate}`;
+    let currentProcessId = "";
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const formData = new FormData(form);
+      const employeeId = String(formData.get("employeeId") || "");
+      const startDate = String(formData.get("startDate") || "");
+      const endDate = String(formData.get("endDate") || "");
+      const processId = String(formData.get("processId") || "");
+      const process = processes.find((item) => item.id === processId);
+
+      if (!startDate || !endDate) {
+        window.alert("请选择开始日期和结束日期。");
+        return;
+      }
+
+      if (startDate > endDate) {
+        window.alert("开始日期不能晚于结束日期。");
+        return;
+      }
+
+      const rows = historyRows.filter((row) => {
+        const inDateRange = row.workDate >= startDate && row.workDate <= endDate;
+        const matchEmployee = !employeeId || row.accountId === employeeId;
+        const matchProcess = !processId || row.processId === processId || (!row.processId && row.processName === process?.name);
+        return inDateRange && matchEmployee && matchProcess;
+      });
+      currentRows = rows;
+      currentTitle = `${startDate} 至 ${endDate}`;
+      currentProcessId = processId;
+      result.innerHTML = renderAdminQueryResult(currentRows, currentTitle, 1, currentProcessId);
+    });
+
+    result.addEventListener("click", (event) => {
+      const pageButton = event.target.closest("[data-action='admin-query-page']");
+      if (!pageButton) return;
+      result.innerHTML = renderAdminQueryResult(currentRows, currentTitle, Number(pageButton.dataset.page) || 1, currentProcessId);
+    });
+  }
+
+  function renderAdminQueryResult(rows, title, currentPage = 1, selectedProcessId = "") {
+    const pageSize = 15;
+    const detailRows = getAdminQueryDetailRows(rows);
+    const totalPages = Math.max(1, Math.ceil(detailRows.length / pageSize));
+    const safePage = Math.min(Math.max(currentPage, 1), totalPages);
+    const pageRows = detailRows.slice((safePage - 1) * pageSize, safePage * pageSize);
+    const dailyWageMap = getAdminDailyWageMap(detailRows);
+    const totalWage = detailRows.reduce((sum, row) => sum + row.totalPrice, 0);
+    const workDays = new Set(detailRows.map((row) => row.workDate).filter(Boolean)).size;
+    const totalQuantity = detailRows.reduce((sum, row) => sum + row.quantity, 0);
+    const secondaryStatLabel = selectedProcessId ? "数量" : "上班天数";
+    const secondaryStatValue = selectedProcessId ? totalQuantity.toFixed(2) : workDays;
+
+    return `
+      <div class="admin-query-result-heading">
+        <div>
+          <h3>${escapeHtml(title)}</h3>
+        </div>
+      </div>
+      <div class="admin-query-stats">
+        <span>工资总额：<strong>¥${totalWage.toFixed(2)}</strong></span>
+        <span>${secondaryStatLabel}：<strong>${secondaryStatValue}</strong></span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table admin-query-table">
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>工序</th>
+              <th>数量</th>
+              <th>工资</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              pageRows.length
+                ? pageRows.map((row, index) => renderAdminQueryRow(row, pageRows[index - 1], detailRows[(safePage - 1) * pageSize + index + 1], dailyWageMap)).join("")
+                : `<tr><td colspan="4" class="history-empty">暂无报工记录</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+      ${renderAdminQueryPagination(detailRows.length, safePage, totalPages)}
+    `;
+  }
+
+  function getAdminQueryDetailRows(rows) {
+    return [...rows].sort((left, right) => {
+      const dateOrder = left.workDate.localeCompare(right.workDate);
+      if (dateOrder) return dateOrder;
+      const employeeOrder = left.accountName.localeCompare(right.accountName, "zh-CN");
+      if (employeeOrder) return employeeOrder;
+      return left.processName.localeCompare(right.processName, "zh-CN");
+    });
+  }
+
+  function getAdminDailyWageMap(rows) {
+    const wageMap = new Map();
+    rows.forEach((row) => {
+      wageMap.set(row.workDate, (wageMap.get(row.workDate) || 0) + row.totalPrice);
+    });
+    return wageMap;
+  }
+
+  function getAdminQuerySummaryRows(rows) {
+    const summaryMap = new Map();
+    rows.forEach((row) => {
+      const key = `${row.accountId}::${row.processId || row.processName}`;
+      const current = summaryMap.get(key) || {
+        accountName: row.accountName,
+        processName: row.processName,
+        quantity: 0,
+        totalPrice: 0,
+      };
+      current.quantity += row.quantity;
+      current.totalPrice += row.totalPrice;
+      summaryMap.set(key, current);
+    });
+
+    return Array.from(summaryMap.values()).sort((left, right) => {
+      const accountOrder = left.accountName.localeCompare(right.accountName, "zh-CN");
+      if (accountOrder) return accountOrder;
+      return left.processName.localeCompare(right.processName, "zh-CN");
+    });
+  }
+
+  function renderAdminQueryPagination(totalRows, currentPage, totalPages) {
+    if (totalPages <= 1) return "";
+
+    return `
+      <div class="history-pagination admin-query-pagination">
+        <button class="button button-secondary button-small" data-action="admin-query-page" data-page="${currentPage - 1}" type="button" ${currentPage === 1 ? "disabled" : ""}>上一页</button>
+        <span>${currentPage} / ${totalPages}，共 ${totalRows} 条</span>
+        <button class="button button-secondary button-small" data-action="admin-query-page" data-page="${currentPage + 1}" type="button" ${currentPage === totalPages ? "disabled" : ""}>下一页</button>
+      </div>
+    `;
+  }
+
+  function renderAdminQueryRow(row, previousRow, nextRow, dailyWageMap) {
+    const shouldShowDate = !previousRow || previousRow.workDate !== row.workDate;
+    const shouldShowDailyTotal = !nextRow || nextRow.workDate !== row.workDate;
+    const dailyTotal = dailyWageMap.get(row.workDate) || 0;
+    return `
+      <tr>
+        <td>${shouldShowDate ? escapeHtml(formatMonthDay(row.workDate)) : ""}</td>
+        <td>${escapeHtml(row.processName)}</td>
+        <td class="money-cell">${row.quantity.toFixed(2)}</td>
+        <td class="money-cell">¥${row.totalPrice.toFixed(2)}</td>
+      </tr>
+      ${
+        shouldShowDailyTotal
+          ? `<tr class="admin-query-day-total-row"><td colspan="4"><span>总工资：<strong>¥${dailyTotal.toFixed(2)}</strong></span></td></tr>`
+          : ""
+      }
+    `;
+  }
+
+  function formatMonthDay(value) {
+    const parts = String(value || "").split("-");
+    if (parts.length !== 3) return value || "";
+    return `${parts[1]}-${parts[2]}`;
   }
 
   function renderAdminFooter(secondaryPath, secondaryLabel) {
@@ -896,6 +2285,31 @@
 
     select.addEventListener("change", update);
     update();
+  }
+
+  function bindDateDisplayControls() {
+    document.querySelectorAll(".date-query-input").forEach((input) => {
+      const update = () => updateDateDisplay(input);
+      input.addEventListener("change", update);
+      input.addEventListener("input", update);
+      update();
+    });
+  }
+
+  function updateDateDisplay(input) {
+    const control = input.closest(".date-query-control");
+    const display = document.querySelector(`[data-date-display='${input.id}']`);
+    if (!control || !display) return;
+
+    control.classList.toggle("has-date", Boolean(input.value));
+    display.innerHTML = input.value ? formatDateDisplay(input.value) : "";
+  }
+
+  function formatDateDisplay(value) {
+    const parts = String(value).split("-");
+    if (parts.length === 2) return `<span>${escapeHtml(parts[0])}</span><span>${escapeHtml(parts[1])}月</span>`;
+    if (parts.length !== 3) return escapeHtml(value);
+    return `<span>${escapeHtml(parts[0])}</span><span>${escapeHtml(parts[1])}-${escapeHtml(parts[2])}</span>`;
   }
 
   function bindLogout() {

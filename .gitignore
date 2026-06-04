@@ -13,6 +13,7 @@ build/
 
 # Logs
 *.log
+backend/logs/
 backend/.server.pid
 backend/data/*.json
 
