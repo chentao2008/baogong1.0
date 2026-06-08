@@ -1193,6 +1193,7 @@ select {
   overflow: visible;
   border-radius: 0;
   background: var(--color-surface);
+  touch-action: pan-y;
 }
 
 .report-table {
@@ -1201,6 +1202,21 @@ select {
   border-spacing: 0;
   table-layout: fixed;
   background: var(--color-surface);
+  transform: translateX(0);
+  will-change: transform;
+}
+
+.report-table.is-dragging {
+  transition: none;
+}
+
+.report-table.is-returning {
+  transition: transform 150ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.report-table.is-swiping-out-left,
+.report-table.is-swiping-out-right {
+  transition: transform 180ms cubic-bezier(0.22, 0.78, 0.28, 1);
 }
 
 .report-table th,

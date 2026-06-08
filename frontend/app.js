@@ -1163,6 +1163,10 @@
     return "";
   }
 
+  function getReportSwipeHelpers() {
+    return window.ReportSwipeHelpers || {};
+  }
+
   function refreshReportTable(processes, monthlyWageBase) {
     const rows = ensureReportRowRules(readReportRowsFromDom(processes));
     document.querySelector("#reportRows").innerHTML = rows.map((row, index) => renderReportRow(row, index, processes)).join("");
@@ -1290,46 +1294,67 @@
     });
   }
 
-  function getPreviousReportedDate(historyRows, currentDate) {
-    const reportDates = Array.from(
-      new Set(
-        historyRows
-          .map((row) => row.workDate || row.work_date || "")
-          .filter((workDate) => workDate && workDate < currentDate)
-      )
-    ).sort((left, right) => right.localeCompare(left));
-
-    return reportDates[0] || "";
-  }
-
-  function getNextReportedDate(historyRows, currentDate) {
-    const reportDates = Array.from(
-      new Set(
-        historyRows
-          .map((row) => row.workDate || row.work_date || "")
-          .filter((workDate) => workDate && workDate > currentDate)
-      )
-    ).sort((left, right) => left.localeCompare(right));
-
-    return reportDates[0] || "";
-  }
-
   function bindReportSwipe(historyRows, workDate) {
     const tableWrap = document.querySelector(".report-table-wrap");
-    if (!tableWrap) return;
+    const table = tableWrap?.querySelector(".report-table");
+    if (!tableWrap || !table) return;
 
     let startX = null;
     let startY = null;
+    let lastX = null;
+    let startTime = 0;
+    let isHorizontalSwipe = false;
+
+    const clearSwipeState = () => {
+      table.classList.remove("is-dragging", "is-returning", "is-swiping-out-left", "is-swiping-out-right");
+      table.style.transform = "";
+    };
+
+    const returnToRest = () => {
+      table.classList.remove("is-dragging", "is-swiping-out-left", "is-swiping-out-right");
+      table.classList.add("is-returning");
+      table.style.transform = "translateX(0)";
+    };
 
     tableWrap.addEventListener(
       "touchstart",
       (event) => {
         const touch = event.touches[0];
         if (!touch) return;
+        clearSwipeState();
         startX = touch.clientX;
         startY = touch.clientY;
+        lastX = touch.clientX;
+        startTime = Date.now();
+        isHorizontalSwipe = false;
       },
       { passive: true }
+    );
+
+    tableWrap.addEventListener(
+      "touchmove",
+      (event) => {
+        const touch = event.touches[0];
+        if (!touch || startX === null || startY === null) return;
+
+        const deltaX = touch.clientX - startX;
+        const deltaY = touch.clientY - startY;
+        lastX = touch.clientX;
+
+        if (!isHorizontalSwipe) {
+          if (Math.abs(deltaX) < 8 && Math.abs(deltaY) < 8) return;
+          if (Math.abs(deltaX) <= Math.abs(deltaY) * 1.25) return;
+          isHorizontalSwipe = true;
+          table.classList.add("is-dragging");
+        }
+
+        if (isHorizontalSwipe) {
+          event.preventDefault();
+          const dampedDeltaX = Math.max(-96, Math.min(96, deltaX * 0.82));
+          table.style.transform = `translateX(${dampedDeltaX}px)`;
+        }
+      },
+      { passive: false }
     );
 
     tableWrap.addEventListener(
@@ -1338,20 +1363,69 @@
         const touch = event.changedTouches[0];
         if (!touch || startX === null || startY === null) return;
 
-        const deltaX = touch.clientX - startX;
+        const deltaX = (lastX || touch.clientX) - startX;
         const deltaY = touch.clientY - startY;
+        const elapsedMs = Math.max(1, Date.now() - startTime);
+        const velocityX = Math.abs(deltaX) / elapsedMs;
         startX = null;
         startY = null;
+        lastX = null;
+        startTime = 0;
 
-        if (Math.abs(deltaX) < 70 || Math.abs(deltaY) > 60 || Math.abs(deltaX) < Math.abs(deltaY) * 1.4) return;
-
-        const targetDate = deltaX > 0 ? getPreviousReportedDate(historyRows, workDate) : getNextReportedDate(historyRows, workDate);
-        if (targetDate) {
-          renderEmployeeWorkReport(targetDate);
+        if (!isHorizontalSwipe || Math.abs(deltaY) > 72 || Math.abs(deltaX) < Math.abs(deltaY) * 1.2) {
+          isHorizontalSwipe = false;
+          returnToRest();
+          return;
         }
+
+        isHorizontalSwipe = false;
+
+        const shouldSwitch = Math.abs(deltaX) >= 42 || (Math.abs(deltaX) >= 26 && velocityX >= 0.45);
+        if (!shouldSwitch) {
+          returnToRest();
+          return;
+        }
+
+        const today = getLocalDateString(new Date());
+        const helpers = getReportSwipeHelpers();
+        const targetDate =
+          deltaX > 0
+            ? helpers.getPreviousReportedDate?.(historyRows, workDate)
+            : helpers.getNextReportSwipeDate?.(historyRows, workDate, today);
+
+        if (!targetDate) {
+          returnToRest();
+          return;
+        }
+
+        table.classList.remove("is-dragging", "is-returning");
+        table.classList.add(deltaX > 0 ? "is-swiping-out-right" : "is-swiping-out-left");
+        table.style.transform = `translateX(${deltaX > 0 ? "105%" : "-105%"})`;
+        window.setTimeout(() => {
+          renderEmployeeWorkReport(targetDate);
+        }, 180);
       },
       { passive: true }
     );
+
+    tableWrap.addEventListener(
+      "touchcancel",
+      () => {
+        startX = null;
+        startY = null;
+        lastX = null;
+        startTime = 0;
+        isHorizontalSwipe = false;
+        returnToRest();
+      },
+      { passive: true }
+    );
+
+    table.addEventListener("transitionend", () => {
+      if (table.classList.contains("is-returning")) {
+        clearSwipeState();
+      }
+    });
   }
 
   function bindReportTable(processes, accountId, monthlyWageBase, hasSavedReport, historyRows, workDate) {
