@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
 from app.services.audit import get_request_ip, write_audit_log
-from app.services.auth import get_account_by_id, hash_password, is_password_hash, public_user, require_admin
+from app.services.auth import get_account_by_id, hash_password, public_user, require_admin
+from app.services.password_view import build_password_display, encrypt_viewable_password
 
 router = APIRouter()
 
@@ -33,11 +34,32 @@ class AccountUpdate(BaseModel):
     process_ids: list[str] | None = None
 
 
+class AccountPasswordReset(BaseModel):
+    password: str = Field(min_length=6)
+
+
 def normalize_account(row, include_password_display: bool = False) -> dict[str, object]:
     account = public_user(row)
     if include_password_display:
-        account["passwordDisplay"] = "已加密，无法查看" if is_password_hash(row.password) else row.password
+        account["passwordDisplay"] = build_password_display(row.password_view_ciphertext)[0]
     return account
+
+
+def account_with_password_display(row) -> tuple[dict[str, object], bool]:
+    account = public_user(row)
+    password_display, was_viewable = build_password_display(row.password_view_ciphertext)
+    account["passwordDisplay"] = password_display
+    return account, was_viewable
+
+
+def can_reset_password(current_user: dict[str, object], target_row) -> bool:
+    if current_user["role"] == "super_admin":
+        return True
+    return (
+        current_user["role"] == "admin"
+        and target_row.role == "employee"
+        and target_row.manager_id == current_user["id"]
+    )
 
 
 async def ensure_unique_account(session: AsyncSession, account: str, account_id: str | None = None) -> None:
@@ -100,6 +122,7 @@ async def list_accounts(
                    account.name,
                    account.status,
                    account.manager_id,
+                   account.password_view_ciphertext,
                    coalesce(array_agg(link.process_id) filter (where link.process_id is not null), '{}') as process_ids
             from admin_accounts account
             left join account_processes link on link.account_id = account.id
@@ -114,12 +137,20 @@ async def list_accounts(
     )
     include_password_display = current_user["role"] == "super_admin"
     rows = result.fetchall()
-    accounts = [normalize_account(row, include_password_display) for row in rows]
+    viewable_by_id: dict[str, bool] = {}
+    accounts = []
+    for row in rows:
+        if include_password_display:
+            account, was_viewable = account_with_password_display(row)
+            viewable_by_id[str(row.id)] = was_viewable
+            accounts.append(account)
+        else:
+            accounts.append(normalize_account(row))
 
     if include_password_display:
         request_ip = get_request_ip(request)
         for row in rows:
-            if is_password_hash(row.password):
+            if not viewable_by_id.get(str(row.id)):
                 continue
             await write_audit_log(
                 session,
@@ -161,8 +192,15 @@ async def create_account(
     await session.execute(
         text(
             """
-            insert into admin_accounts (id, account, password, role, name, status, manager_id)
-            values (:id, :account, :password, :role, :name, :status, :manager_id)
+            insert into admin_accounts (
+                id, account, password, role, name, status, manager_id,
+                password_view_ciphertext, password_view_updated_at
+            )
+            values (
+                :id, :account, :password, :role, :name, :status, :manager_id,
+                :password_view_ciphertext,
+                case when cast(:password_view_ciphertext as text) is null then null else now() end
+            )
             """
         ),
         {
@@ -173,6 +211,7 @@ async def create_account(
             "name": name,
             "status": payload.status,
             "manager_id": manager_id,
+            "password_view_ciphertext": encrypt_viewable_password(payload.password.strip()),
         },
     )
     for process_id in payload.process_ids:
@@ -192,6 +231,64 @@ async def create_account(
     return normalize_account(row)
 
 
+@router.post("/api/admin/accounts/{account_id}/reset-password")
+async def reset_account_password(
+    account_id: str,
+    payload: AccountPasswordReset,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: dict[str, object] = Depends(require_admin),
+) -> dict[str, object]:
+    row = await get_account_by_id(session, account_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="account not found")
+    if not can_reset_password(current_user, row):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    next_password = payload.password.strip()
+    if len(next_password) < 6:
+        raise HTTPException(status_code=422, detail="password must be at least 6 characters")
+    password_view_ciphertext = encrypt_viewable_password(next_password)
+    await session.execute(
+        text(
+            """
+            update admin_accounts
+            set password = :password,
+                password_view_ciphertext = :password_view_ciphertext,
+                password_view_updated_at = case
+                    when cast(:password_view_ciphertext as text) is null then null
+                    else now()
+                end,
+                updated_at = now()
+            where id = :id
+            """
+        ),
+        {
+            "id": account_id,
+            "password": hash_password(next_password),
+            "password_view_ciphertext": password_view_ciphertext,
+        },
+    )
+    await write_audit_log(
+        session,
+        actor_id=str(current_user["id"]),
+        action="password_reset",
+        target_type="account",
+        target_id=str(row.id),
+        payload={
+            "target_account": row.account,
+            "target_role": row.role,
+            "whether_password_was_viewable": password_view_ciphertext is not None,
+            "request_ip": get_request_ip(request),
+        },
+        required=True,
+    )
+    await session.commit()
+
+    row = await get_account_by_id(session, account_id)
+    return normalize_account(row, include_password_display=current_user["role"] == "super_admin")
+
+
 @router.patch("/api/admin/accounts/{account_id}")
 async def update_account(
     account_id: str,
@@ -209,6 +306,8 @@ async def update_account(
         raise HTTPException(status_code=403, detail="forbidden")
     if payload.role is not None and payload.role != row.role:
         raise HTTPException(status_code=403, detail="forbidden")
+    if payload.password is not None:
+        raise HTTPException(status_code=400, detail="use reset password endpoint")
     if row.id == current_user["id"] and payload.status == "disabled":
         raise HTTPException(status_code=403, detail="forbidden")
     if payload.process_ids is not None:
@@ -224,7 +323,6 @@ async def update_account(
             """
             update admin_accounts
             set account = :account,
-                password = :password,
                 role = :role,
                 name = :name,
                 status = :status,
@@ -236,7 +334,6 @@ async def update_account(
         {
             "id": account_id,
             "account": next_account,
-            "password": hash_password(payload.password.strip()) if payload.password is not None else row.password,
             "role": payload.role or row.role,
             "name": payload.name.strip() if payload.name is not None else (next_account if payload.account is not None else row.name),
             "status": payload.status or row.status,

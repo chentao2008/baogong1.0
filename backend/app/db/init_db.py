@@ -20,6 +20,8 @@ async def initialize_database() -> None:
                     name text not null,
                     status text not null check (status in ('active', 'disabled')),
                     manager_id text null,
+                    password_view_ciphertext text null,
+                    password_view_updated_at timestamptz null,
                     created_at timestamptz not null default now(),
                     updated_at timestamptz not null default now()
                 )
@@ -107,6 +109,8 @@ async def initialize_database() -> None:
         await connection.execute(text("create index if not exists idx_audit_logs_action on audit_logs(action)"))
         await connection.execute(text("create index if not exists idx_audit_logs_created_at on audit_logs(created_at)"))
         await connection.execute(text("alter table processes add column if not exists manager_id text null"))
+        await connection.execute(text("alter table admin_accounts add column if not exists password_view_ciphertext text null"))
+        await connection.execute(text("alter table admin_accounts add column if not exists password_view_updated_at timestamptz null"))
         await connection.execute(text("alter table processes drop constraint if exists processes_name_key"))
         await connection.execute(text("create index if not exists idx_processes_manager_id on processes(manager_id)"))
         await connection.execute(

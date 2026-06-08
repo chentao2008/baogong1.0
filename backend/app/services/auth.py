@@ -26,7 +26,7 @@ def verify_password(password: str, stored_password: str | None) -> bool:
     if not stored_password:
         return False
     if not is_password_hash(stored_password):
-        return secrets.compare_digest(stored_password, password)
+        return False
     try:
         return bcrypt.checkpw(password.encode("utf-8"), stored_password.encode("utf-8"))
     except ValueError:
@@ -60,6 +60,8 @@ async def get_account_by_account(session: AsyncSession, account: str):
                    account.name,
                    account.status,
                    account.manager_id,
+                   account.password_view_ciphertext,
+                   account.password_view_updated_at,
                    coalesce(array_agg(link.process_id) filter (where link.process_id is not null), '{}') as process_ids
             from admin_accounts account
             left join account_processes link on link.account_id = account.id
@@ -83,6 +85,8 @@ async def get_account_by_id(session: AsyncSession, account_id: str):
                    account.name,
                    account.status,
                    account.manager_id,
+                   account.password_view_ciphertext,
+                   account.password_view_updated_at,
                    coalesce(array_agg(link.process_id) filter (where link.process_id is not null), '{}') as process_ids
             from admin_accounts account
             left join account_processes link on link.account_id = account.id

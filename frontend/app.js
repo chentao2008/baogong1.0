@@ -93,7 +93,20 @@
 
     if (!response.ok) {
       const message = await response.text();
-      throw new Error(message || `请求失败：${response.status}`);
+      let detail = message;
+      try {
+        const parsed = JSON.parse(message);
+        if (Array.isArray(parsed.detail)) {
+          detail = parsed.detail.map((item) => item.msg || JSON.stringify(item)).join("；");
+        } else if (parsed.detail && typeof parsed.detail === "object") {
+          detail = parsed.detail.msg || JSON.stringify(parsed.detail);
+        } else {
+          detail = parsed.detail || message;
+        }
+      } catch (parseError) {
+        detail = message;
+      }
+      throw new Error(detail || `请求失败：${response.status}`);
     }
 
     if (response.status === 204) return null;
@@ -179,6 +192,14 @@
     await apiRequest(`/api/admin/accounts/${encodeURIComponent(accountId)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
+    });
+    return true;
+  }
+
+  async function resetSharedAccountPassword(accountId, password) {
+    await apiRequest(`/api/admin/accounts/${encodeURIComponent(accountId)}/reset-password`, {
+      method: "POST",
+      body: JSON.stringify({ password }),
     });
     return true;
   }
@@ -1604,6 +1625,7 @@
   function renderAccountRow(account, data, user) {
     const statusClass = account.status === "active" ? "button-success" : "button-danger";
     const canManageAccount = !isSuperAdmin(user) && (account.id === user.id || account.managerId === user.id);
+    const canResetAccountPassword = isSuperAdmin(user) || (account.role === "employee" && account.managerId === user.id);
     const canDeleteAccount = !isSuperAdmin(user) && account.role === "employee" && account.managerId === user.id;
     const deleteHtml = canDeleteAccount
       ? `<button class="button button-danger button-small account-delete-button" data-action="delete-account" data-id="${account.id}" type="button" ${account.id === user.id ? "disabled" : ""}>删除</button>`
@@ -1611,7 +1633,7 @@
     const editNameHtml = canManageAccount
       ? `<button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-account-name" data-id="${account.id}" type="button">修改</button>`
       : "";
-    const editPasswordHtml = canManageAccount
+    const editPasswordHtml = canResetAccountPassword
       ? `<button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-password" data-id="${account.id}" type="button">修改</button>`
       : "";
     const processButtonHtml = canManageAccount && account.role === "employee"
@@ -1620,7 +1642,7 @@
     const statusButtonHtml = canManageAccount
       ? `<button class="button ${statusClass} button-small account-status-button" data-action="toggle-account-status" data-id="${account.id}" type="button" ${account.id === user.id ? "disabled" : ""}>${account.status === "active" ? "启用" : "停用"}</button>`
       : `<span class="status-tag ${account.status === "active" ? "status-active" : "status-disabled"}">${account.status === "active" ? "启用" : "停用"}</span>`;
-    const passwordText = isSuperAdmin(user) ? account.passwordDisplay || "已加密，无法查看" : "已加密保存";
+    const passwordText = isSuperAdmin(user) ? account.passwordDisplay || "需重置后可查看" : "已加密保存";
 
     return `
       <tr>
@@ -1826,12 +1848,16 @@
     if (!password || !password.trim()) return;
 
     const nextPassword = password.trim();
+    if (nextPassword.length < 6) {
+      window.alert("密码至少需要 6 位。");
+      return;
+    }
 
     try {
-      await updateSharedAccount(accountId, { password: nextPassword });
+      await resetSharedAccountPassword(accountId, nextPassword);
       renderAccountManagement();
     } catch (error) {
-      window.alert("后端保存失败，请稍后再试。");
+      window.alert(`后端保存失败：${error.message || "请稍后再试。"}`);
     }
   }
 

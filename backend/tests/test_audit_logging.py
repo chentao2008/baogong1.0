@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.db.session import engine
 from app.db.init_db import initialize_database
 from app.main import app
+from app.core.config import get_settings
 from app.services.auth import hash_password
+from app.services.password_view import encrypt_viewable_password
 
 
 TEST_PASSWORD = "audit-test-password"
@@ -21,6 +24,7 @@ TEST_EMPLOYEE_ACCOUNTS = ["audit_test_employee_a", "audit_test_employee_b"]
 
 
 async def delete_test_data() -> None:
+    await engine.dispose()
     await initialize_database()
     await engine.dispose()
     async with engine.begin() as connection:
@@ -75,6 +79,8 @@ async def delete_test_data() -> None:
 
 
 async def prepare_test_data() -> None:
+    os.environ["PASSWORD_VIEW_SECRET"] = "test-audit-password-view-secret"
+    get_settings.cache_clear()
     await delete_test_data()
     async with engine.begin() as connection:
         await connection.execute(
@@ -94,16 +100,23 @@ async def prepare_test_data() -> None:
             await connection.execute(
                 text(
                     """
-                    insert into admin_accounts (id, account, password, role, name, status, manager_id)
-                    values (:id, :account, :password, 'employee', :name, 'active', :manager_id)
+                    insert into admin_accounts (
+                        id, account, password, role, name, status, manager_id,
+                        password_view_ciphertext, password_view_updated_at
+                    )
+                    values (
+                        :id, :account, :password, 'employee', :name, 'active', :manager_id,
+                        :password_view_ciphertext, now()
+                    )
                     """
                 ),
                 {
                     "id": account_id,
                     "account": account,
-                    "password": TEST_PASSWORD,
+                    "password": hash_password(TEST_PASSWORD),
                     "name": account,
                     "manager_id": TEST_SUPER_ID,
+                    "password_view_ciphertext": encrypt_viewable_password(TEST_PASSWORD),
                 },
             )
     await engine.dispose()

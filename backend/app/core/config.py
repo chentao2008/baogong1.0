@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     session_cookie_name: str = "employee_work_session"
     session_ttl_seconds: int = 60 * 60 * 12
     session_cookie_secure: bool | None = None
+    password_view_secret: str | None = None
 
     @property
     def cors_origins(self) -> list[str]:
