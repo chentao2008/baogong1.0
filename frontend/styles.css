@@ -686,6 +686,36 @@ select {
   width: 100%;
 }
 
+.admin-export-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 10px;
+}
+
+.admin-export-field {
+  min-width: 0;
+  gap: 6px;
+}
+
+.admin-export-field label {
+  font-size: 13px;
+}
+
+.admin-export-field .input {
+  height: 36px;
+}
+
+.admin-export-button {
+  min-width: 96px;
+}
+
+#monthSearchForm .month-export-button {
+  grid-column: 2 / -1;
+  grid-row: 2;
+}
+
 .admin-query-result-heading {
   display: flex;
   align-items: center;
@@ -1736,10 +1766,34 @@ select {
   color: #276fae;
 }
 
+.status-active {
+  background: rgba(39, 166, 94, 0.14);
+  color: #237a49;
+}
+
+.status-disabled {
+  background: rgba(209, 73, 73, 0.12);
+  color: #b43b3b;
+}
+
 @media (min-width: 960px) {
   .login-layout,
   .employee-layout {
     padding: 0 24px 40px;
+  }
+
+  .login-layout .mobile-shell {
+    width: min(100%, 520px);
+  }
+
+  .login-panel {
+    width: 100%;
+    max-width: 520px;
+    padding: 18px;
+  }
+
+  .employee-shell {
+    width: min(100%, 720px);
   }
 
   .toolbar {

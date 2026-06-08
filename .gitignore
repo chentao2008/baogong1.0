@@ -22,3 +22,4 @@ backend/data/*.json
 Thumbs.db
 .vscode/
 .idea/
+frontend/.server.pid

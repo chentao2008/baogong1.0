@@ -1,13 +1,13 @@
 (function () {
   const app = document.querySelector("#app");
   const APP_TITLE = "乐意纺织报工系统";
-  const STORAGE_USER_KEY = "currentUser";
-  const STORAGE_DATA_KEY = "demoAdminData";
   const PROCESS_PAGE_SIZE = 10;
   let accountApiAvailable = false;
   let latestAdminData = null;
   let currentProcessPage = 1;
   let processApiAvailable = false;
+  let currentUser = null;
+  let authReady = false;
 
   const roleOptions = [
     { value: "super_admin", label: "超级权限" },
@@ -17,40 +17,8 @@
   const processUnitOptions = ["元/米", "元/条", "元/个", "元/千针", "元/卷", "元/天", "元/上午", "元/下午", "元/小时", "元/套", "元/车", "元/大包", "元/小包", "元/包"];
 
   const defaultData = {
-    accounts: [
-      {
-        id: "u-super",
-        account: "admin",
-        password: "admin123",
-        role: "super_admin",
-        name: "超级管理员",
-        status: "active",
-        managerId: null,
-      },
-      {
-        id: "u-manager",
-        account: "manager",
-        password: "manager123",
-        role: "admin",
-        name: "车间管理员",
-        status: "active",
-        managerId: "u-super",
-      },
-      {
-        id: "u-employee",
-        account: "employee",
-        password: "employee123",
-        role: "employee",
-        name: "张师傅",
-        status: "active",
-        managerId: "u-manager",
-      },
-    ],
-    processes: [
-      { id: "p-cut", name: "裁剪", price: 1.2, unit: "元/米", status: "active" },
-      { id: "p-sew", name: "缝制", price: 2.6, unit: "元/条", status: "active" },
-      { id: "p-pack", name: "包装", price: 0.8, unit: "元/包", status: "disabled" },
-    ],
+    accounts: [],
+    processes: [],
   };
 
   const routes = {
@@ -65,7 +33,15 @@
   };
 
   window.addEventListener("hashchange", renderRoute);
-  renderRoute();
+  initializeApp();
+
+  async function initializeApp() {
+    if (!["/", "/login"].includes(getPath())) {
+      await refreshCurrentUser();
+    }
+    authReady = true;
+    renderRoute();
+  }
 
   function getPath() {
     return window.location.hash.replace(/^#/, "") || "/";
@@ -76,38 +52,28 @@
   }
 
   function renderRoute() {
+    if (!authReady) {
+      app.innerHTML = `
+        <main class="app-page login-layout">
+          ${renderAppHeader()}
+          <section class="mobile-shell panel placeholder-card">
+            <h1 class="page-title">加载中</h1>
+          </section>
+        </main>
+      `;
+      return;
+    }
     const path = getPath();
     const renderer = routes[path] || renderNotFound;
     renderer();
   }
 
   function readData() {
-    const localData = readStorageData(localStorage);
-    if (localData) return localData;
-
-    const legacySessionData = readStorageData(sessionStorage);
-    if (legacySessionData) {
-      return legacySessionData;
-    }
-
     return clone(defaultData);
   }
 
   function getLatestAdminData() {
     return latestAdminData || readData();
-  }
-
-  function readStorageData(storage) {
-    try {
-      const parsed = JSON.parse(storage.getItem(STORAGE_DATA_KEY));
-      if (parsed && Array.isArray(parsed.accounts) && Array.isArray(parsed.processes)) {
-        return parsed;
-      }
-    } catch (error) {
-      return null;
-    }
-
-    return null;
   }
 
   function getApiBaseUrl() {
@@ -117,6 +83,7 @@
 
   async function apiRequest(path, options = {}) {
     const response = await fetch(`${getApiBaseUrl()}${path}`, {
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(options.headers || {}),
@@ -133,6 +100,40 @@
     return response.json();
   }
 
+  async function downloadFileRequest(path) {
+    const response = await fetch(`${getApiBaseUrl()}${path}`, {
+      credentials: "include",
+    });
+
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || `请求失败：${response.status}`);
+    }
+
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const filenameMatch = disposition.match(/filename\*=UTF-8''([^;]+)|filename="([^"]+)"/i);
+    const filename = decodeURIComponent(filenameMatch?.[1] || filenameMatch?.[2] || "员工月度报工详情.docx");
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function exportEmployeeMonthlyWord(month) {
+    await downloadFileRequest(`/api/employee/work-reports/monthly-export?month=${encodeURIComponent(month)}`);
+  }
+
+  async function exportAdminMonthlyWord(accountId, month) {
+    await downloadFileRequest(
+      `/api/admin/work-reports/monthly-export?account_id=${encodeURIComponent(accountId)}&month=${encodeURIComponent(month)}`
+    );
+  }
+
   async function loadSharedProcesses(localData) {
     try {
       const remoteProcesses = await apiRequest("/api/admin/processes");
@@ -147,9 +148,8 @@
 
   async function loadSharedAccounts(localData) {
     try {
-      let remoteAccounts = await apiRequest("/api/admin/accounts");
+      const remoteAccounts = await apiRequest("/api/admin/accounts");
       accountApiAvailable = true;
-      remoteAccounts = await migrateLocalAccounts(localData.accounts, remoteAccounts);
       localData.accounts = remoteAccounts;
       return localData;
     } catch (error) {
@@ -158,46 +158,13 @@
     }
   }
 
-  async function migrateLocalAccounts(localAccounts, remoteAccounts) {
-    const remoteNames = new Set(remoteAccounts.map((account) => account.account));
-    const localOnlyAccounts = localAccounts.filter((account) => account.account && !remoteNames.has(account.account));
-
-    if (!localOnlyAccounts.length) return remoteAccounts;
-
-    for (const account of localOnlyAccounts) {
-      try {
-        await apiRequest("/api/admin/accounts", {
-          method: "POST",
-          body: JSON.stringify({
-            account: account.account,
-            password: account.password,
-            role: account.role,
-            name: account.name || account.account,
-            status: account.status || "active",
-            manager_id: account.managerId || null,
-            process_ids: account.processIds || [],
-          }),
-        });
-      } catch (error) {
-        // 本地演示账号迁移只做尽力同步，重名或临时网络失败不阻塞页面。
-      }
-    }
-
-    return apiRequest("/api/admin/accounts");
-  }
-
   async function loginSharedAccount(account, password) {
-    try {
-      const user = await apiRequest("/api/login", {
-        method: "POST",
-        body: JSON.stringify({ account, password }),
-      });
-      accountApiAvailable = true;
-      return user;
-    } catch (error) {
-      accountApiAvailable = false;
-      return null;
-    }
+    const user = await apiRequest("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ account, password }),
+    });
+    accountApiAvailable = true;
+    return user;
   }
 
   async function createSharedAccount(account) {
@@ -265,24 +232,50 @@
     return apiRequest(`/api/work-report-history/${encodeURIComponent(accountId)}`);
   }
 
+  async function queryWorkReports(params = {}) {
+    const query = new URLSearchParams();
+    if (params.accountId) query.set("account_id", params.accountId);
+    if (params.month) query.set("month", params.month);
+    if (params.startDate) query.set("start_date", params.startDate);
+    if (params.endDate) query.set("end_date", params.endDate);
+    if (params.processId) query.set("process_id", params.processId);
+    if (params.page) query.set("page", String(params.page));
+    if (params.pageSize) query.set("page_size", String(params.pageSize));
+    const suffix = query.toString();
+    return apiRequest(`/api/work-reports/query${suffix ? `?${suffix}` : ""}`);
+  }
+
   function clone(value) {
     return JSON.parse(JSON.stringify(value));
   }
 
   function getCurrentUser() {
-    try {
-      return JSON.parse(sessionStorage.getItem(STORAGE_USER_KEY));
-    } catch (error) {
-      return null;
-    }
+    return currentUser;
   }
 
   function setCurrentUser(user) {
-    sessionStorage.setItem(STORAGE_USER_KEY, JSON.stringify(user));
+    currentUser = user;
   }
 
   function clearCurrentUser() {
-    sessionStorage.removeItem(STORAGE_USER_KEY);
+    currentUser = null;
+  }
+
+  async function refreshCurrentUser() {
+    try {
+      currentUser = await apiRequest("/api/me");
+    } catch (error) {
+      currentUser = null;
+    }
+  }
+
+  async function logoutCurrentUser() {
+    try {
+      await apiRequest("/api/auth/logout", { method: "POST" });
+    } catch (error) {
+      // 即使服务端已经没有登录态，也清理前端内存状态并回到登录页。
+    }
+    clearCurrentUser();
   }
 
   function requireEmployee() {
@@ -341,7 +334,7 @@
             <p class="error-message" id="loginError">账号、密码不正确，或账号已停用。</p>
             <button class="button button-primary button-large" type="submit">登录</button>
           </form>
-          <p class="hint">演示账号：admin / admin123，manager / manager123，employee / employee123</p>
+          <p class="hint">请输入已创建的账号和密码登录</p>
         </section>
       </main>
     `;
@@ -385,37 +378,15 @@
     const form = new FormData(event.currentTarget);
     const account = String(form.get("account") || "").trim();
     const password = String(form.get("password") || "");
-    const data = readData();
     const error = document.querySelector("#loginError");
-    let matchedUser = await loginSharedAccount(account, password);
 
-    if (!matchedUser) {
-      matchedUser = data.accounts.find((item) => item.account === account);
-      if (matchedUser && matchedUser.password === password && matchedUser.status === "active") {
-        try {
-          await migrateLocalAccounts(data.accounts, []);
-          matchedUser = await loginSharedAccount(account, password);
-        } catch (migrationError) {
-          matchedUser = null;
-        }
-      }
-    }
-
-    if (!matchedUser || matchedUser.password !== password || matchedUser.status !== "active") {
+    try {
+      const user = await loginSharedAccount(account, password);
+      setCurrentUser(user);
+      navigate(user.role === "employee" ? "/employee" : "/admin/accounts");
+    } catch (loginError) {
       error.classList.add("is-visible");
-      return;
     }
-
-    const user = {
-      id: matchedUser.id,
-      account: matchedUser.account,
-      name: matchedUser.name,
-      role: matchedUser.role,
-      processIds: matchedUser.processIds || [],
-    };
-
-    setCurrentUser(user);
-    navigate(user.role === "employee" ? "/employee" : "/admin/accounts");
   }
 
   async function renderEmployeeWorkReport(selectedDate) {
@@ -438,11 +409,18 @@
     let processes = [];
     let report = { rows: [] };
     let history = { rows: [] };
+    let monthSummary = { summary: { totalWage: 0 } };
 
     try {
       processes = await loadEmployeeProcesses(user.id);
       report = await loadWorkReport(user.id, workDate);
       history = await loadWorkReportHistory(user.id);
+      monthSummary = await queryWorkReports({
+        accountId: user.id,
+        month: workDate.slice(0, 7),
+        page: 1,
+        pageSize: 1,
+      });
     } catch (error) {
       window.alert("报工数据加载失败，请确认后端服务已启动。");
     }
@@ -450,7 +428,9 @@
     const hasSavedReport = Boolean(report.rows && report.rows.length);
     const rows = normalizeReportRows(report.rows || []);
     const dailyWage = calculateDailyWage(rows);
-    const monthlyWageBase = calculateMonthlyWageBase(history.rows || [], workDate);
+    const savedDailyWage = Number(report.dailyWage) || (report.rows || []).reduce((sum, row) => sum + (Number(row.totalPrice) || 0), 0);
+    const monthTotalWage = Number(monthSummary?.summary?.totalWage) || 0;
+    const monthlyWageBase = Math.max(0, monthTotalWage - savedDailyWage);
     const monthlyWage = monthlyWageBase + dailyWage;
 
     app.innerHTML = `
@@ -521,16 +501,16 @@
       </main>
     `;
 
-    let history = { rows: [], totalWage: 0 };
+    let initialPage = { rows: [], total: 0, summary: { totalWage: 0, totalQuantity: 0, workDays: 0 } };
     let processes = [];
     try {
-      history = await loadWorkReportHistory(user.id);
       processes = await loadEmployeeProcesses(user.id);
+      initialPage = await queryWorkReports({ accountId: user.id, page: 1, pageSize: 15 });
     } catch (error) {
       window.alert("历史数据加载失败，请确认后端服务已启动。");
     }
 
-    const historyRows = normalizeHistoryRows(history.rows || [], processes);
+    const initialRows = normalizeHistoryRows(initialPage.rows || [], processes);
     const today = getLocalDateString(new Date());
     const currentMonth = today.slice(0, 7);
 
@@ -556,6 +536,7 @@
                   <input class="input employee-query-input date-query-input" id="historyEndMonth" name="historyEndMonth" type="month" value="${currentMonth}" />
                 </div>
                 <button class="button button-primary button-medium employee-query-button" type="submit">搜索</button>
+                <button class="button button-secondary button-medium employee-query-button month-export-button" id="exportMonthWordButton" type="button">导出本月 Word</button>
               </form>
               <form class="employee-query-form process-query-form" id="processSearchForm" novalidate>
                 <label for="historyProcess">按工序查询</label>
@@ -577,7 +558,7 @@
               </form>
             </div>
             <div id="historyResult">
-              ${renderDefaultDailyDetailResult(historyRows)}
+              ${renderDefaultDailyDetailResult(initialRows, 1, initialPage.total || initialRows.length)}
             </div>
           </section>
           <div class="action-row">
@@ -593,7 +574,7 @@
     document.querySelector("#backReportButton").addEventListener("click", () => navigate("/employee"));
     bindSelectPlaceholder("#historyProcess");
     bindDateDisplayControls();
-    bindEmployeeHistoryQuery(historyRows, processes, today);
+    bindEmployeeHistoryQuery(user, processes, today, initialPage.total || initialRows.length);
     bindLogout();
   }
 
@@ -607,6 +588,7 @@
         quantity: Number(row.quantity) || 0,
         unitPrice: Number(row.unitPrice ?? row.unit_price) || 0,
         totalPrice: Number(row.totalPrice ?? row.total_price) || 0,
+        dateTotalPrice: Number(row.dateTotalPrice ?? row.date_total_price) || 0,
         confirmStatus: row.confirmStatus || row.confirm_status || "未确认",
       };
     });
@@ -624,10 +606,49 @@
     });
   }
 
-  function bindEmployeeHistoryQuery(historyRows, processes, today) {
+  function bindEmployeeHistoryQuery(user, processes, today, initialTotal) {
     const result = document.querySelector("#historyResult");
+    const PAGE_SIZE_DEFAULT = 15;
+    const PAGE_SIZE_DATE = 10;
 
-    document.querySelector("#monthSearchForm").addEventListener("submit", (event) => {
+    async function showDefault(page) {
+      try {
+        const response = await queryWorkReports({
+          accountId: user.id,
+          page,
+          pageSize: PAGE_SIZE_DEFAULT,
+        });
+        const rows = normalizeHistoryRows(response.rows || [], processes);
+        result.innerHTML = renderDefaultDailyDetailResult(rows, page, response.total || 0);
+      } catch (error) {
+        window.alert("数据查询失败，请稍后再试。");
+      }
+    }
+
+    async function showDateDetail(startDate, endDate, page) {
+      try {
+        const response = await queryWorkReports({
+          accountId: user.id,
+          startDate,
+          endDate,
+          page,
+          pageSize: PAGE_SIZE_DATE,
+        });
+        const rows = normalizeHistoryRows(response.rows || [], processes);
+        result.innerHTML = renderDateDetailResult(
+          rows,
+          startDate,
+          endDate,
+          page,
+          response.total || 0,
+          Number(response?.summary?.totalWage) || 0,
+        );
+      } catch (error) {
+        window.alert("数据查询失败，请稍后再试。");
+      }
+    }
+
+    document.querySelector("#monthSearchForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const startMonth = document.querySelector("#historyStartMonth").value;
       const endMonth = document.querySelector("#historyEndMonth").value;
@@ -641,10 +662,40 @@
         return;
       }
 
-      result.innerHTML = renderMonthRangeSummaryResult(historyRows, startMonth, endMonth);
+      try {
+        const months = getMonthRangeKeys(startMonth, endMonth).reverse();
+        const summaries = await Promise.all(
+          months.map(async (month) => {
+            const response = await queryWorkReports({ accountId: user.id, month, page: 1, pageSize: 1 });
+            const summary = response?.summary || {};
+            return {
+              month,
+              wage: Number(summary.totalWage) || 0,
+              workDays: Number(summary.workDays) || 0,
+            };
+          })
+        );
+        result.innerHTML = renderMonthRangeSummaryResultFromSummaries(summaries, startMonth, endMonth);
+      } catch (error) {
+        window.alert("月份汇总查询失败，请稍后再试。");
+      }
     });
 
-    document.querySelector("#processSearchForm").addEventListener("submit", (event) => {
+    document.querySelector("#exportMonthWordButton").addEventListener("click", async () => {
+      const exportMonth = document.querySelector("#historyStartMonth").value;
+      if (!exportMonth) {
+        window.alert("请选择开始月份。");
+        return;
+      }
+
+      try {
+        await exportEmployeeMonthlyWord(exportMonth);
+      } catch (error) {
+        window.alert(error.message || "Word 导出失败，请稍后再试。");
+      }
+    });
+
+    document.querySelector("#processSearchForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const processId = document.querySelector("#historyProcess").value;
       const startDate = document.querySelector("#processStartDate").value;
@@ -661,12 +712,21 @@
         return;
       }
 
-      const rows = historyRows.filter((row) => {
-        const sameProcess = row.processId === processId || (!row.processId && row.processName === process?.name);
-        return sameProcess && row.workDate >= startDate && row.workDate <= endDate;
-      });
-
-      result.innerHTML = renderProcessSearchResult(rows, process, startDate, endDate);
+      try {
+        const response = await queryWorkReports({
+          accountId: user.id,
+          processId,
+          startDate,
+          endDate,
+          page: 1,
+          pageSize: 1000,
+        });
+        const rows = normalizeHistoryRows(response.rows || [], processes);
+        const summary = response?.summary || {};
+        result.innerHTML = renderProcessSearchResultFromServer(rows, process, startDate, endDate, summary);
+      } catch (error) {
+        window.alert("工序查询失败，请稍后再试。");
+      }
     });
 
     document.querySelector("#historyResult").addEventListener("click", (event) => {
@@ -674,33 +734,26 @@
         const startDate = event.target.dataset.startDate;
         const endDate = event.target.dataset.endDate;
         const page = Number(event.target.dataset.page) || 1;
-        const rows = getDateRangeRows(historyRows, startDate, endDate);
-        result.innerHTML = renderDateDetailResult(rows, startDate, endDate, page);
+        showDateDetail(startDate, endDate, page);
         return;
       }
 
       if (event.target.matches("[data-action='default-page']")) {
         const page = Number(event.target.dataset.page) || 1;
-        result.innerHTML = renderDefaultDailyDetailResult(historyRows, page);
+        showDefault(page);
         return;
       }
 
       if (!event.target.matches("[data-action='show-default-history']")) return;
-      result.innerHTML = renderDefaultDailyDetailResult(historyRows);
+      showDefault(1);
     });
   }
 
-  function renderDefaultDailyDetailResult(historyRows, page = 1) {
-    const rows = [...historyRows].sort((left, right) => {
-      const dateOrder = right.workDate.localeCompare(left.workDate);
-      if (dateOrder) return dateOrder;
-      return left.processName.localeCompare(right.processName, "zh-CN");
-    });
-    const pageSize = 15;
-    const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
-    const currentPage = Math.min(Math.max(1, page), totalPages);
-    const pageRows = rows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-    const dailyWageMap = getDailyWageMap(rows);
+  function renderDefaultDailyDetailResult(pageRows, currentPage, totalRows) {
+    const safePageSize = 15;
+    const totalPages = Math.max(1, Math.ceil((totalRows || pageRows.length) / safePageSize));
+    const safePage = Math.min(Math.max(1, currentPage), totalPages);
+    const dailyWageMap = getDailyWageMap(pageRows);
 
     return `
       <div class="report-table-wrap">
@@ -716,20 +769,25 @@
           <tbody>
             ${
               pageRows.length
-                ? pageRows.map((row, index) => renderDefaultDailyDetailRow(row, pageRows[index - 1], rows[(currentPage - 1) * pageSize + index + 1], dailyWageMap)).join("")
+                ? pageRows.map((row, index) => renderDefaultDailyDetailRow(row, pageRows[index - 1], pageRows[index + 1], dailyWageMap)).join("")
                 : `<tr><td colspan="4" class="history-empty">暂无报工记录</td></tr>`
             }
           </tbody>
         </table>
       </div>
-      ${renderDefaultPagination(rows.length, currentPage, totalPages)}
+      ${renderDefaultPagination(totalRows || pageRows.length, safePage, totalPages)}
     `;
   }
 
   function getDailyWageMap(rows) {
     const wageMap = new Map();
     rows.forEach((row) => {
-      wageMap.set(row.workDate, (wageMap.get(row.workDate) || 0) + row.totalPrice);
+      const dateTotal = Number(row.dateTotalPrice);
+      if (Number.isFinite(dateTotal) && dateTotal > 0) {
+        wageMap.set(row.workDate, dateTotal);
+      } else if (!wageMap.has(row.workDate) || !Number.isFinite(wageMap.get(row.workDate))) {
+        wageMap.set(row.workDate, (wageMap.get(row.workDate) || 0) + row.totalPrice);
+      }
     });
     return wageMap;
   }
@@ -805,16 +863,7 @@
     `;
   }
 
-  function renderMonthRangeSummaryResult(historyRows, startMonth, endMonth) {
-    const summaries = getMonthRangeKeys(startMonth, endMonth).reverse().map((month) => {
-      const rows = historyRows.filter((row) => row.workDate.slice(0, 7) === month);
-      const workDays = new Set(rows.map((row) => row.workDate).filter(Boolean));
-      return {
-        month,
-        wage: rows.reduce((sum, row) => sum + row.totalPrice, 0),
-        workDays: workDays.size,
-      };
-    });
+  function renderMonthRangeSummaryResultFromSummaries(summaries, startMonth, endMonth) {
     const totalWage = summaries.reduce((sum, summary) => sum + summary.wage, 0);
 
     return `
@@ -868,16 +917,17 @@
     }, "");
   }
 
-  function renderDateDetailResult(rows, startDate, endDate, page = 1) {
+  function renderDateDetailResult(pageRows, startDate, endDate, page = 1, totalRows = null, totalWage = null) {
     const pageSize = 10;
-    const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+    const effectiveTotal = totalRows == null ? pageRows.length : totalRows;
+    const totalPages = Math.max(1, Math.ceil(effectiveTotal / pageSize));
     const currentPage = Math.min(Math.max(1, page), totalPages);
-    const pageRows = rows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-    const totalWage = rows.reduce((sum, row) => sum + row.totalPrice, 0);
+    const effectiveWage =
+      totalWage == null ? pageRows.reduce((sum, row) => sum + row.totalPrice, 0) : totalWage;
     return `
       ${renderHistoryResultTitle(`${startDate} 至 ${endDate} 工资详情`)}
       <div class="history-result-toolbar">
-        <span>总工资：¥${totalWage.toFixed(2)}</span>
+        <span>总工资：¥${effectiveWage.toFixed(2)}</span>
         <button class="button button-secondary button-small" data-action="show-default-history" type="button">默认详情</button>
       </div>
       <div class="report-table-wrap">
@@ -894,14 +944,14 @@
           </thead>
           <tbody>
             ${
-              pageRows.length
+              pageRows && pageRows.length
                 ? pageRows.map((row) => renderDateRangeDetailRow(row)).join("")
                 : `<tr><td colspan="6" class="history-empty">${escapeHtml(startDate)} 至 ${escapeHtml(endDate)} 暂无报工记录</td></tr>`
             }
           </tbody>
         </table>
       </div>
-      ${renderDatePagination(rows.length, currentPage, totalPages, startDate, endDate)}
+      ${renderDatePagination(effectiveTotal, currentPage, totalPages, startDate, endDate)}
     `;
   }
 
@@ -930,10 +980,10 @@
     `;
   }
 
-  function renderProcessSearchResult(rows, process, startDate, endDate) {
-    const totalQuantity = rows.reduce((sum, row) => sum + row.quantity, 0);
-    const totalWage = rows.reduce((sum, row) => sum + row.totalPrice, 0);
-    const workDays = new Set(rows.map((row) => row.workDate).filter(Boolean)).size;
+  function renderProcessSearchResultFromServer(rows, process, startDate, endDate, summary) {
+    const totalQuantity = Number(summary?.totalQuantity) || rows.reduce((sum, row) => sum + row.quantity, 0);
+    const totalWage = Number(summary?.totalWage) || rows.reduce((sum, row) => sum + row.totalPrice, 0);
+    const workDays = Number(summary?.workDays) || new Set(rows.map((row) => row.workDate).filter(Boolean)).size;
 
     return `
       ${renderProcessHistoryTitle(`${process ? process.name : "工序"} 统计`, `${startDate} 至 ${endDate}`)}
@@ -1380,48 +1430,51 @@
     latestAdminData = data;
     const visibleAccounts = getVisibleAccounts(data, user);
     const processesForAccountConfig = data.processes.filter((process) => process.status === "active");
-    const creatableRoles = isSuperAdmin(user)
-      ? roleOptions
-      : roleOptions.filter((role) => role.value === "employee");
+    const canCreateAccount = !isSuperAdmin(user);
+    const creatableRoles = roleOptions.filter((role) => role.value === "employee");
 
     app.innerHTML = `
       <main class="app-page admin-layout">
         ${renderAppHeader()}
         <section class="admin-shell">
           <section class="admin-main admin-management-grid">
-            <section class="admin-section">
-              <div class="section-heading account-create-heading">
-                <div>
-                  <h2 class="account-create-title">新增账号</h2>
-                </div>
-              </div>
-              <form class="admin-form account-create-form" id="accountForm" novalidate>
-                <div class="field">
-                  <input class="input" id="newAccountName" name="account" aria-label="账号名称" placeholder="账号名称" />
-                </div>
-                <div class="field">
-                  <input class="input" id="newAccountPassword" name="password" type="text" aria-label="密码" placeholder="密码" />
-                </div>
-                <div class="field">
-                  <select class="input select is-placeholder" id="newAccountRole" name="role" aria-label="权限">
-                    <option value="" disabled selected>权限</option>
-                    ${creatableRoles.map((role) => `<option value="${role.value}">${role.label}</option>`).join("")}
-                  </select>
-                </div>
-                <div class="field account-process-field">
-                  <div class="account-process-checklist" id="newAccountProcesses" role="group" aria-label="可报工工序">
-                    <p class="account-process-title">工序配置</p>
-                    ${
-                      processesForAccountConfig.length
-                        ? processesForAccountConfig.map((process) => renderProcessCheckbox(process)).join("")
-                        : `<p class="account-process-empty">暂无工序，请先新增工序</p>`
-                    }
-                  </div>
-                </div>
-                <button class="button button-primary button-medium" type="submit">新增账号</button>
-                <p class="error-message" id="accountError"></p>
-              </form>
-            </section>
+            ${
+              canCreateAccount
+                ? `<section class="admin-section">
+                    <div class="section-heading account-create-heading">
+                      <div>
+                        <h2 class="account-create-title">新增账号</h2>
+                      </div>
+                    </div>
+                    <form class="admin-form account-create-form" id="accountForm" novalidate>
+                      <div class="field">
+                        <input class="input" id="newAccountName" name="account" aria-label="账号名称" placeholder="账号名称" />
+                      </div>
+                      <div class="field">
+                        <input class="input" id="newAccountPassword" name="password" type="text" aria-label="密码" placeholder="密码" />
+                      </div>
+                      <div class="field">
+                        <select class="input select is-placeholder" id="newAccountRole" name="role" aria-label="权限">
+                          <option value="" disabled selected>权限</option>
+                          ${creatableRoles.map((role) => `<option value="${role.value}">${role.label}</option>`).join("")}
+                        </select>
+                      </div>
+                      <div class="field account-process-field">
+                        <div class="account-process-checklist" id="newAccountProcesses" role="group" aria-label="可报工工序">
+                          <p class="account-process-title">工序配置</p>
+                          ${
+                            processesForAccountConfig.length
+                              ? processesForAccountConfig.map((process) => renderProcessCheckbox(process)).join("")
+                              : `<p class="account-process-empty">暂无工序，请先新增工序</p>`
+                          }
+                        </div>
+                      </div>
+                      <button class="button button-primary button-medium" type="submit">新增账号</button>
+                      <p class="error-message" id="accountError"></p>
+                    </form>
+                  </section>`
+                : ""
+            }
             <section class="admin-section">
               <div class="section-heading account-list-heading">
                 <div>
@@ -1433,7 +1486,7 @@
                   <thead>
                     <tr>
                       <th>账号</th>
-                      <th>密码</th>
+                      <th>密码管理</th>
                       <th>工序</th>
                       <th>权限</th>
                       <th>状态</th>
@@ -1453,8 +1506,10 @@
     `;
 
     bindAdminNavigation();
-    bindSelectPlaceholder("#newAccountRole");
-    document.querySelector("#accountForm").addEventListener("submit", (event) => handleCreateAccount(event, user));
+    if (canCreateAccount) {
+      bindSelectPlaceholder("#newAccountRole");
+      document.querySelector("#accountForm").addEventListener("submit", (event) => handleCreateAccount(event, user));
+    }
     document.querySelectorAll("[data-action='delete-account']").forEach((button) => {
       button.addEventListener("click", () => handleDeleteAccount(button.dataset.id));
     });
@@ -1474,28 +1529,43 @@
 
   function renderAccountRow(account, data, user) {
     const statusClass = account.status === "active" ? "button-success" : "button-danger";
-    const deleteHtml = isSuperAdmin(user)
+    const canManageAccount = !isSuperAdmin(user) && (account.id === user.id || account.managerId === user.id);
+    const canDeleteAccount = !isSuperAdmin(user) && account.role === "employee" && account.managerId === user.id;
+    const deleteHtml = canDeleteAccount
       ? `<button class="button button-danger button-small account-delete-button" data-action="delete-account" data-id="${account.id}" type="button" ${account.id === user.id ? "disabled" : ""}>删除</button>`
       : "";
+    const editNameHtml = canManageAccount
+      ? `<button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-account-name" data-id="${account.id}" type="button">修改</button>`
+      : "";
+    const editPasswordHtml = canManageAccount
+      ? `<button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-password" data-id="${account.id}" type="button">修改</button>`
+      : "";
+    const processButtonHtml = canManageAccount && account.role === "employee"
+      ? `<button class="button button-primary button-small account-process-button" data-action="manage-account-processes" data-id="${account.id}" type="button">工序</button>`
+      : "";
+    const statusButtonHtml = canManageAccount
+      ? `<button class="button ${statusClass} button-small account-status-button" data-action="toggle-account-status" data-id="${account.id}" type="button" ${account.id === user.id ? "disabled" : ""}>${account.status === "active" ? "启用" : "停用"}</button>`
+      : `<span class="status-tag ${account.status === "active" ? "status-active" : "status-disabled"}">${account.status === "active" ? "启用" : "停用"}</span>`;
+    const passwordText = isSuperAdmin(user) ? account.passwordDisplay || "已加密，无法查看" : "已加密保存";
 
     return `
       <tr>
         <td class="account-name-cell">
           <strong>${escapeHtml(account.account)}</strong>
-          <button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-account-name" data-id="${account.id}" type="button">修改</button>
+          ${editNameHtml}
         </td>
         <td class="account-password-cell">
-          <span class="account-password">${escapeHtml(account.password)}</span>
-          <button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-password" data-id="${account.id}" type="button">修改</button>
+          <span class="account-password">${escapeHtml(passwordText)}</span>
+          ${editPasswordHtml}
         </td>
         <td class="account-process-cell">
-          <button class="button button-primary button-small account-process-button" data-action="manage-account-processes" data-id="${account.id}" type="button">工序</button>
+          ${processButtonHtml}
         </td>
         <td class="account-role-cell">
           <button class="button button-secondary button-small account-role-button" type="button" disabled>${escapeHtml(getRoleLabel(account.role))}</button>
         </td>
         <td class="account-status-cell">
-          <button class="button ${statusClass} button-small account-status-button" data-action="toggle-account-status" data-id="${account.id}" type="button" ${account.id === user.id ? "disabled" : ""}>${account.status === "active" ? "启用" : "停用"}</button>
+          ${statusButtonHtml}
         </td>
         <td class="account-action-cell">
           ${deleteHtml}
@@ -1635,7 +1705,6 @@
     const account = {
       id: `u-${Date.now()}`,
       account: accountName,
-      password,
       role,
       name: accountName,
       status: "active",
@@ -1679,7 +1748,7 @@
     const account = data.accounts.find((item) => item.id === accountId);
     if (!account) return;
 
-    const password = window.prompt("请输入新的账号密码", account.password);
+    const password = window.prompt("请输入新的账号密码");
     if (!password || !password.trim()) return;
 
     const nextPassword = password.trim();
@@ -1756,7 +1825,7 @@
 
     data = await loadSharedProcesses(data);
     latestAdminData = data;
-    const canDeleteProcess = isSuperAdmin(user);
+    const canManageProcesses = !isSuperAdmin(user);
     const totalProcessPages = Math.max(1, Math.ceil(data.processes.length / PROCESS_PAGE_SIZE));
     currentProcessPage = Math.min(currentProcessPage, totalProcessPages);
     const processPageStart = (currentProcessPage - 1) * PROCESS_PAGE_SIZE;
@@ -1764,32 +1833,36 @@
 
     app.innerHTML = `
       <main class="app-page admin-layout">
-        ${renderAppHeader()}
+          ${renderAppHeader()}
         <section class="admin-shell">
           <section class="admin-main admin-management-grid">
-            <section class="admin-section">
-              <div class="section-heading process-create-heading">
-                <div>
-                  <h2 class="process-create-title">新增工序</h2>
-                </div>
-              </div>
-              <form class="admin-form process-form" id="processForm" novalidate>
-                <div class="field">
-                  <input class="input" id="processName" name="name" aria-label="工序名称" placeholder="工序名称" />
-                </div>
-                <div class="field">
-                  <input class="input number-input" id="processPrice" name="price" type="number" min="0" step="0.01" aria-label="当前单价" placeholder="当前单价" />
-                </div>
-                <div class="field">
-                  <select class="input select is-placeholder" id="processUnit" name="unit" aria-label="单位选择">
-                    <option value="" disabled selected>单位选择</option>
-                    ${processUnitOptions.map((unit) => `<option value="${unit}">${unit}</option>`).join("")}
-                  </select>
-                </div>
-                <button class="button button-primary button-medium" type="submit">新增工序</button>
-                <p class="error-message" id="processError"></p>
-              </form>
-            </section>
+            ${
+              canManageProcesses
+                ? `<section class="admin-section">
+                    <div class="section-heading process-create-heading">
+                      <div>
+                        <h2 class="process-create-title">新增工序</h2>
+                      </div>
+                    </div>
+                    <form class="admin-form process-form" id="processForm" novalidate>
+                      <div class="field">
+                        <input class="input" id="processName" name="name" aria-label="工序名称" placeholder="工序名称" />
+                      </div>
+                      <div class="field">
+                        <input class="input number-input" id="processPrice" name="price" type="number" min="0" step="0.01" aria-label="当前单价" placeholder="当前单价" />
+                      </div>
+                      <div class="field">
+                        <select class="input select is-placeholder" id="processUnit" name="unit" aria-label="单位选择">
+                          <option value="" disabled selected>单位选择</option>
+                          ${processUnitOptions.map((unit) => `<option value="${unit}">${unit}</option>`).join("")}
+                        </select>
+                      </div>
+                      <button class="button button-primary button-medium" type="submit">新增工序</button>
+                      <p class="error-message" id="processError"></p>
+                    </form>
+                  </section>`
+                : ""
+            }
             <section class="admin-section">
               <div class="section-heading process-list-heading">
                 <div>
@@ -1797,17 +1870,17 @@
                 </div>
               </div>
               <div class="table-wrap account-table-wrap">
-                <table class="data-table account-table process-table ${canDeleteProcess ? "process-table-with-actions" : ""}">
+                <table class="data-table account-table process-table ${canManageProcesses ? "process-table-with-actions" : ""}">
                   <thead>
                     <tr>
                       <th>工序名称</th>
                       <th>当前单价</th>
                       <th>状态</th>
-                      ${canDeleteProcess ? "<th>操作</th>" : ""}
+                      ${canManageProcesses ? "<th>操作</th>" : ""}
                     </tr>
                   </thead>
                   <tbody>
-                    ${visibleProcesses.map((process) => renderProcessRow(process, canDeleteProcess)).join("")}
+                    ${visibleProcesses.map((process) => renderProcessRow(process, canManageProcesses)).join("")}
                   </tbody>
                 </table>
               </div>
@@ -1820,8 +1893,10 @@
     `;
 
     bindAdminNavigation();
-    bindSelectPlaceholder("#processUnit");
-    document.querySelector("#processForm").addEventListener("submit", handleCreateProcess);
+    if (canManageProcesses) {
+      bindSelectPlaceholder("#processUnit");
+      document.querySelector("#processForm").addEventListener("submit", handleCreateProcess);
+    }
     document.querySelectorAll("[data-action='rename-process']").forEach((button) => {
       button.addEventListener("click", () => handleRenameProcess(button.dataset.id));
     });
@@ -1861,24 +1936,28 @@
     `;
   }
 
-  function renderProcessRow(process, canDeleteProcess) {
+  function renderProcessRow(process, canManageProcess) {
     const statusClass = process.status === "active" ? "button-success" : "button-danger";
     const unitLabel = process.unit ? ` / ${escapeHtml(process.unit.replace(/^元\//, ""))}` : "";
     return `
       <tr>
         <td class="account-name-cell">
           <strong>${escapeHtml(process.name)}</strong>
-          <button class="button button-primary button-small account-inline-button account-edit-button" data-action="rename-process" data-id="${process.id}" type="button">修改</button>
+          ${canManageProcess ? `<button class="button button-primary button-small account-inline-button account-edit-button" data-action="rename-process" data-id="${process.id}" type="button">修改</button>` : ""}
         </td>
         <td class="account-password-cell">
           <span class="account-password process-price">¥${Number(process.price).toFixed(2)}${unitLabel}</span>
-          <button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-price" data-id="${process.id}" type="button">修改</button>
+          ${canManageProcess ? `<button class="button button-primary button-small account-inline-button account-edit-button" data-action="change-price" data-id="${process.id}" type="button">修改</button>` : ""}
         </td>
         <td class="account-status-cell">
-          <button class="button ${statusClass} button-small account-status-button" data-action="toggle-process-status" data-id="${process.id}" type="button">${process.status === "active" ? "启用" : "停用"}</button>
+          ${
+            canManageProcess
+              ? `<button class="button ${statusClass} button-small account-status-button" data-action="toggle-process-status" data-id="${process.id}" type="button">${process.status === "active" ? "启用" : "停用"}</button>`
+              : `<span class="status-tag ${process.status === "active" ? "status-active" : "status-disabled"}">${process.status === "active" ? "启用" : "停用"}</span>`
+          }
         </td>
         ${
-          canDeleteProcess
+          canManageProcess
             ? `<td class="account-action-cell">
                 <button class="button button-danger button-small account-delete-button" data-action="delete-process" data-id="${process.id}" type="button">删除</button>
               </td>`
@@ -1982,7 +2061,7 @@
 
   async function handleDeleteProcess(processId) {
     const user = getCurrentUser();
-    if (!user || !isSuperAdmin(user)) return;
+    if (!user || isSuperAdmin(user)) return;
     if (!window.confirm("确定删除这个工序吗？删除后工序列表中不再显示。")) return;
 
     const data = getLatestAdminData();
@@ -2021,18 +2100,31 @@
     latestAdminData = data;
 
     const visibleEmployees = getVisibleAccounts(data, user).filter((account) => account.role === "employee");
-    const histories = await Promise.all(
-      visibleEmployees.map(async (account) => {
-        try {
-          return { account, history: await loadWorkReportHistory(account.id) };
-        } catch (error) {
-          return { account, history: { rows: [] } };
-        }
-      })
-    );
-    const historyRows = normalizeAdminHistoryRows(histories, data.processes);
-    const latestWorkDate = getLatestWorkDate(historyRows) || getLocalDateString(new Date());
-    const defaultRows = historyRows.filter((row) => row.workDate === latestWorkDate);
+
+    let latestWorkDate = getLocalDateString(new Date());
+    let defaultRows = [];
+    let defaultTotal = 0;
+    let defaultSummary = { totalWage: 0, totalQuantity: 0, workDays: 0 };
+    try {
+      const latestResponse = await queryWorkReports({ page: 1, pageSize: 1 });
+      const latestRow = (latestResponse.rows || [])[0];
+      if (latestRow && latestRow.workDate) {
+        latestWorkDate = latestRow.workDate;
+      }
+      const defaultResponse = await queryWorkReports({
+        startDate: latestWorkDate,
+        endDate: latestWorkDate,
+        page: 1,
+        pageSize: 1000,
+      });
+      defaultRows = normalizeAdminHistoryRowsFromServer(defaultResponse.rows || [], data.processes, visibleEmployees);
+      defaultTotal = defaultResponse.total || defaultRows.length;
+      defaultSummary = defaultResponse.summary || defaultSummary;
+    } catch (error) {
+      defaultRows = [];
+    }
+
+    const adminExportMonth = latestWorkDate.slice(0, 7);
 
     app.innerHTML = `
       <main class="app-page admin-layout">
@@ -2066,18 +2158,22 @@
                 <div class="field">
                   <label for="adminQueryProcess">工序</label>
                   <select class="input select" id="adminQueryProcess" name="processId">
-                    <option value="">全部工序</option>
-                    ${data.processes
-                      .map((process) => `<option value="${escapeHtml(process.id)}">${escapeHtml(process.name)}</option>`)
-                      .join("")}
+                    ${renderAdminQueryProcessOptions(data.processes, visibleEmployees, "")}
                   </select>
                 </div>
                 <button class="button button-primary button-medium admin-query-submit" type="submit">查询</button>
               </form>
+              <div class="admin-export-row">
+                <div class="field admin-export-field">
+                  <label for="adminExportMonth">导出月份</label>
+                  <input class="input" id="adminExportMonth" name="exportMonth" type="month" value="${escapeHtml(adminExportMonth)}" />
+                </div>
+                <button class="button button-secondary button-medium admin-export-button" id="adminExportWordButton" type="button">导出 Word</button>
+              </div>
             </section>
             <section class="admin-section admin-query-section">
               <div id="adminQueryResult">
-                ${renderAdminQueryResult(defaultRows, `${latestWorkDate} 至 ${latestWorkDate}`)}
+                ${renderAdminQueryResult(defaultRows, `${latestWorkDate} 至 ${latestWorkDate}`, 1, "", defaultSummary)}
               </div>
             </section>
           </section>
@@ -2087,17 +2183,59 @@
     `;
 
     bindAdminNavigation();
-    bindAdminQueryForm(historyRows, data.processes, latestWorkDate);
+    bindAdminQueryForm(data.processes, visibleEmployees, latestWorkDate, defaultSummary);
   }
 
-  function bindAdminQueryForm(historyRows, processes, latestWorkDate) {
+  function bindAdminQueryForm(processes, employees, latestWorkDate, initialSummary) {
     const form = document.querySelector("#adminQueryForm");
     const result = document.querySelector("#adminQueryResult");
     if (!form || !result) return;
+    const employeeSelect = document.querySelector("#adminQueryEmployee");
+    const processSelect = document.querySelector("#adminQueryProcess");
+    const PAGE_SIZE = 15;
 
-    let currentRows = historyRows.filter((row) => row.workDate === latestWorkDate);
+    let currentFilters = {
+      employeeId: "",
+      startDate: latestWorkDate,
+      endDate: latestWorkDate,
+      processId: "",
+    };
     let currentTitle = `${latestWorkDate} 至 ${latestWorkDate}`;
     let currentProcessId = "";
+
+    async function fetchAndRender(page) {
+      try {
+        const response = await queryWorkReports({
+          accountId: currentFilters.employeeId || undefined,
+          startDate: currentFilters.startDate,
+          endDate: currentFilters.endDate,
+          processId: currentFilters.processId || undefined,
+          page,
+          pageSize: PAGE_SIZE,
+        });
+        const rows = normalizeAdminHistoryRowsFromServer(response.rows || [], processes, employees);
+        result.innerHTML = renderAdminQueryResult(
+          rows,
+          currentTitle,
+          page,
+          currentProcessId,
+          response.summary || {},
+          response.total || rows.length,
+        );
+      } catch (error) {
+        window.alert("查询失败，请稍后再试。");
+      }
+    }
+
+    if (employeeSelect && processSelect) {
+      employeeSelect.addEventListener("change", () => {
+        const currentProcessId = processSelect.value;
+        const employeeId = employeeSelect.value;
+        const availableProcesses = getAdminQueryProcesses(processes, employees, employeeId);
+        const nextProcessId = availableProcesses.some((process) => process.id === currentProcessId) ? currentProcessId : "";
+        processSelect.innerHTML = renderAdminQueryProcessOptions(processes, employees, employeeId, nextProcessId);
+      });
+    }
 
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -2106,7 +2244,6 @@
       const startDate = String(formData.get("startDate") || "");
       const endDate = String(formData.get("endDate") || "");
       const processId = String(formData.get("processId") || "");
-      const process = processes.find((item) => item.id === processId);
 
       if (!startDate || !endDate) {
         window.alert("请选择开始日期和结束日期。");
@@ -2118,35 +2255,88 @@
         return;
       }
 
-      const rows = historyRows.filter((row) => {
-        const inDateRange = row.workDate >= startDate && row.workDate <= endDate;
-        const matchEmployee = !employeeId || row.accountId === employeeId;
-        const matchProcess = !processId || row.processId === processId || (!row.processId && row.processName === process?.name);
-        return inDateRange && matchEmployee && matchProcess;
-      });
-      currentRows = rows;
+      currentFilters = { employeeId, startDate, endDate, processId };
       currentTitle = `${startDate} 至 ${endDate}`;
       currentProcessId = processId;
-      result.innerHTML = renderAdminQueryResult(currentRows, currentTitle, 1, currentProcessId);
+      fetchAndRender(1);
     });
 
     result.addEventListener("click", (event) => {
       const pageButton = event.target.closest("[data-action='admin-query-page']");
       if (!pageButton) return;
-      result.innerHTML = renderAdminQueryResult(currentRows, currentTitle, Number(pageButton.dataset.page) || 1, currentProcessId);
+      fetchAndRender(Number(pageButton.dataset.page) || 1);
+    });
+
+    const exportButton = document.querySelector("#adminExportWordButton");
+    if (exportButton) {
+      exportButton.addEventListener("click", async () => {
+        const employeeId = employeeSelect ? employeeSelect.value : "";
+        const exportMonth = document.querySelector("#adminExportMonth")?.value || "";
+        if (!employeeId) {
+          window.alert("请选择要导出的员工。");
+          return;
+        }
+        if (!exportMonth) {
+          window.alert("请选择导出月份。");
+          return;
+        }
+
+        try {
+          await exportAdminMonthlyWord(employeeId, exportMonth);
+        } catch (error) {
+          window.alert(error.message || "Word 导出失败，请稍后再试。");
+        }
+      });
+    }
+  }
+
+  function normalizeAdminHistoryRowsFromServer(rows, processes, employees) {
+    return (rows || []).map((row) => {
+      const process = processes.find((item) => item.id === row.processId || item.name === row.processName);
+      const employee = employees.find((account) => account.id === row.accountId);
+      return {
+        workDate: row.workDate || row.work_date || "",
+        processId: row.processId || row.process_id || process?.id || "",
+        processName: row.processName || row.process_name || process?.name || "",
+        quantity: Number(row.quantity) || 0,
+        unitPrice: Number(row.unitPrice ?? row.unit_price) || 0,
+        totalPrice: Number(row.totalPrice ?? row.total_price) || 0,
+        dateTotalPrice: Number(row.dateTotalPrice ?? row.date_total_price) || 0,
+        confirmStatus: row.confirmStatus || row.confirm_status || "未确认",
+        accountId: row.accountId || row.account_id || employee?.id || "",
+        accountName: row.accountLogin || employee?.account || "",
+        employeeName: row.accountName || employee?.name || employee?.account || "",
+      };
     });
   }
 
-  function renderAdminQueryResult(rows, title, currentPage = 1, selectedProcessId = "") {
+  function getAdminQueryProcesses(processes, employees, employeeId) {
+    return window.AdminQueryHelpers.getProcessesForAdminQueryEmployee(processes, employees, employeeId);
+  }
+
+  function renderAdminQueryProcessOptions(processes, employees, employeeId, selectedProcessId = "") {
+    const visibleProcesses = getAdminQueryProcesses(processes, employees, employeeId);
+    return `
+      <option value="">全部工序</option>
+      ${visibleProcesses
+        .map(
+          (process) =>
+            `<option value="${escapeHtml(process.id)}" ${process.id === selectedProcessId ? "selected" : ""}>${escapeHtml(process.name)}</option>`
+        )
+        .join("")}
+    `;
+  }
+
+  function renderAdminQueryResult(rows, title, currentPage = 1, selectedProcessId = "", summary = {}, totalRows = null) {
     const pageSize = 15;
-    const detailRows = getAdminQueryDetailRows(rows);
-    const totalPages = Math.max(1, Math.ceil(detailRows.length / pageSize));
+    const pageRows = getAdminQueryDetailRows(rows);
+    const effectiveTotal = totalRows == null ? pageRows.length : totalRows;
+    const totalPages = Math.max(1, Math.ceil(effectiveTotal / pageSize));
     const safePage = Math.min(Math.max(currentPage, 1), totalPages);
-    const pageRows = detailRows.slice((safePage - 1) * pageSize, safePage * pageSize);
-    const dailyWageMap = getAdminDailyWageMap(detailRows);
-    const totalWage = detailRows.reduce((sum, row) => sum + row.totalPrice, 0);
-    const workDays = new Set(detailRows.map((row) => row.workDate).filter(Boolean)).size;
-    const totalQuantity = detailRows.reduce((sum, row) => sum + row.quantity, 0);
+    const dailyWageMap = getAdminDailyWageMap(pageRows);
+    const totalWage = Number(summary.totalWage) || pageRows.reduce((sum, row) => sum + row.totalPrice, 0);
+    const workDays = Number(summary.workDays) || new Set(pageRows.map((row) => row.workDate).filter(Boolean)).size;
+    const totalQuantity = Number(summary.totalQuantity) || pageRows.reduce((sum, row) => sum + row.quantity, 0);
     const secondaryStatLabel = selectedProcessId ? "数量" : "上班天数";
     const secondaryStatValue = selectedProcessId ? totalQuantity.toFixed(2) : workDays;
 
@@ -2173,13 +2363,13 @@
           <tbody>
             ${
               pageRows.length
-                ? pageRows.map((row, index) => renderAdminQueryRow(row, pageRows[index - 1], detailRows[(safePage - 1) * pageSize + index + 1], dailyWageMap)).join("")
+                ? pageRows.map((row, index) => renderAdminQueryRow(row, pageRows[index - 1], pageRows[index + 1], dailyWageMap)).join("")
                 : `<tr><td colspan="4" class="history-empty">暂无报工记录</td></tr>`
             }
           </tbody>
         </table>
       </div>
-      ${renderAdminQueryPagination(detailRows.length, safePage, totalPages)}
+      ${renderAdminQueryPagination(effectiveTotal, safePage, totalPages)}
     `;
   }
 
@@ -2196,7 +2386,12 @@
   function getAdminDailyWageMap(rows) {
     const wageMap = new Map();
     rows.forEach((row) => {
-      wageMap.set(row.workDate, (wageMap.get(row.workDate) || 0) + row.totalPrice);
+      const dateTotal = Number(row.dateTotalPrice);
+      if (Number.isFinite(dateTotal) && dateTotal > 0) {
+        wageMap.set(row.workDate, dateTotal);
+      } else if (!wageMap.has(row.workDate)) {
+        wageMap.set(row.workDate, (wageMap.get(row.workDate) || 0) + row.totalPrice);
+      }
     });
     return wageMap;
   }
@@ -2327,8 +2522,8 @@
   function bindLogout() {
     const logoutButton = document.querySelector("#logoutButton");
     if (!logoutButton) return;
-    logoutButton.addEventListener("click", () => {
-      clearCurrentUser();
+    logoutButton.addEventListener("click", async () => {
+      await logoutCurrentUser();
       navigate("/login");
     });
   }

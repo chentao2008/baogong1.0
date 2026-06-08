@@ -12,11 +12,7 @@
 6. 员工报工页面占位
 7. 基于 hash 的前端路由
 
-临时演示账号：
-
-- 超级权限：admin / admin123，登录后进入 `#/admin/accounts`
-- 管理员：manager / manager123，登录后进入 `#/admin/accounts`
-- 员工：employee / employee123，登录后进入 `#/employee`
+账号由超级权限在后台维护，系统不再自动创建临时演示账号。
 
 后续接入后端认证 API 后，由后端返回当前账号角色，前端按角色跳转。
 
