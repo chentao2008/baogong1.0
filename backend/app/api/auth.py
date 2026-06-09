@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.services.auth import (
     clear_session_cookie,
@@ -14,10 +15,9 @@ from app.services.auth import (
     upgrade_plaintext_password_if_needed,
     verify_password,
 )
-from app.core.config import get_settings
+from app.services.login_rate_limit import check_locked, clear_failures, record_failure
 
 router = APIRouter()
-settings = get_settings()
 
 
 class LoginRequest(BaseModel):
@@ -30,10 +30,18 @@ async def authenticate(
     response: Response,
     session: AsyncSession,
 ) -> dict[str, object]:
-    row = await get_account_by_account(session, payload.account.strip())
+    settings = get_settings()
+    account = payload.account.strip()
+    locked_message = check_locked(account, settings.login_lockout_seconds)
+    if locked_message:
+        raise HTTPException(status_code=429, detail=locked_message)
+
+    row = await get_account_by_account(session, account)
     if not row or row.status != "active" or not verify_password(payload.password, row.password):
+        record_failure(account, settings.login_max_failures, settings.login_lockout_seconds)
         raise HTTPException(status_code=401, detail="invalid account or password")
 
+    clear_failures(account)
     await upgrade_plaintext_password_if_needed(session, row.id, row.password, payload.password)
     token = await create_session(session, row.id)
     await session.commit()
@@ -65,7 +73,7 @@ async def logout(
     response: Response,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, bool]:
-    await delete_session(session, request.cookies.get(settings.session_cookie_name))
+    await delete_session(session, request.cookies.get(get_settings().session_cookie_name))
     await session.commit()
     clear_session_cookie(response)
     return {"ok": True}

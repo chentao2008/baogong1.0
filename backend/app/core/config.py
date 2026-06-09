@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 60 * 60 * 12
     session_cookie_secure: bool | None = None
     password_view_secret: str | None = None
+    login_max_failures: int = 5
+    login_lockout_seconds: int = 15 * 60
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
 
     @property
     def cors_origins(self) -> list[str]:
