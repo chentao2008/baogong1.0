@@ -8,6 +8,7 @@ from sqlalchemy import text
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.main import app
+from app.core.config import Settings
 from app.db.session import engine
 from app.services.auth import hash_password
 
@@ -18,6 +19,12 @@ TEST_EMPLOYEE_ID = "u-test-auth-employee"
 TEST_SUPER_ACCOUNT = "auth_test_admin"
 TEST_EMPLOYEE_ACCOUNT = "auth_test_employee"
 TEST_PASSWORD = "auth-test-password"
+
+
+def test_default_session_ttl_is_one_year() -> None:
+    settings = Settings(database_url="postgresql+asyncpg://test:test@localhost/test", _env_file=None)
+
+    assert settings.session_ttl_seconds == 60 * 60 * 24 * 365
 
 
 async def delete_test_accounts() -> None:

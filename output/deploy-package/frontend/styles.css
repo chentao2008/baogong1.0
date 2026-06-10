@@ -76,7 +76,7 @@ select {
 }
 
 .employee-layout {
-  row-gap: 30px;
+  row-gap: 8px;
 }
 
 .mobile-shell {
@@ -267,7 +267,8 @@ select {
 
 .employee-shell {
   display: flex;
-  min-height: 100%;
+  min-height: 0;
+  height: 100%;
   flex-direction: column;
   align-self: stretch;
   justify-self: center;
@@ -326,10 +327,38 @@ select {
   margin-top: 18px;
 }
 
+.report-top-actions,
+.report-bottom-actions,
+.report-top-summary {
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 0;
+  margin-bottom: 10px;
+}
+
+.report-top-summary {
+  display: grid;
+  flex: 0 0 auto;
+}
+
+.report-bottom-actions {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  margin-bottom: 0;
+}
+
+.report-action-button {
+  width: 100%;
+  min-height: 48px;
+  border-radius: 999px;
+  box-shadow: 0 4px 0 rgba(24, 91, 143, 0.2), 0 9px 18px rgba(32, 85, 124, 0.12);
+  font-size: 16px;
+}
+
 .employee-logout-row {
   display: grid;
-  margin-top: auto;
-  padding-top: 18px;
+  flex: 0 0 auto;
+  padding-top: 8px;
 }
 
 .admin-layout {
@@ -1145,6 +1174,10 @@ select {
 }
 
 .report-panel {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 0;
+  flex-direction: column;
   border: 0;
   background: transparent;
   box-shadow: none;
@@ -1154,7 +1187,7 @@ select {
 
 .report-date-row {
   display: grid;
-  grid-template-columns: 62px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto minmax(132px, auto);
   align-items: center;
   border-radius: 0;
   background: var(--color-surface);
@@ -1166,9 +1199,9 @@ select {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  box-shadow: inset -1px 0 0 rgba(185, 210, 223, 0.72);
   color: var(--color-text);
   font-weight: 800;
+  padding-left: 8px;
 }
 
 .report-date-input {
@@ -1176,6 +1209,28 @@ select {
   border: 0;
   border-radius: 0;
   background: transparent;
+  justify-self: end;
+  max-width: 156px;
+  min-width: 132px;
+  padding-left: 2px;
+  padding-right: 10px;
+}
+
+.report-month-workdays {
+  display: inline-flex;
+  min-width: 0;
+  height: 38px;
+  align-items: center;
+  padding: 0 10px;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.report-month-workdays strong {
+  margin: 0 2px;
 }
 
 .report-lock-note {
@@ -1189,11 +1244,23 @@ select {
 }
 
 .report-table-wrap {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 0;
+  flex-direction: column;
   width: 100%;
   overflow: visible;
   border-radius: 0;
   background: var(--color-surface);
   touch-action: pan-y;
+}
+
+.report-table-body-wrap {
+  min-height: 0;
+  flex: 1 1 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .report-table {
@@ -1280,6 +1347,19 @@ select {
   position: relative;
   height: 43px;
   z-index: 1;
+}
+
+.report-process-name {
+  display: inline-flex;
+  width: 100%;
+  min-height: 43px;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text);
+  font-weight: 700;
+  line-height: 1.25;
+  padding: 0 6px;
+  word-break: break-word;
 }
 
 .report-process-control.is-open {
@@ -1378,20 +1458,37 @@ select {
   font-weight: 400;
 }
 
-.report-table tfoot td {
-  height: 44px;
+.report-summary-bar {
+  display: grid;
+  min-height: 48px;
+  flex: 0 0 auto;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.report-summary-item {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 1px solid rgba(185, 210, 223, 0.78);
+  border-radius: 999px;
+  background: var(--color-surface);
+  box-shadow: 0 4px 0 rgba(24, 91, 143, 0.12), 0 9px 18px rgba(32, 85, 124, 0.08);
   color: var(--color-text);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 800;
+  padding: 0 8px;
 }
 
-.report-table tfoot td[colspan] {
-  padding-right: 48px;
-  text-align: right;
+.report-summary-item:not(:last-child) {
+  box-shadow: 0 4px 0 rgba(24, 91, 143, 0.12), 0 9px 18px rgba(32, 85, 124, 0.08);
 }
 
-.report-table tfoot tr:last-child td {
-  border-bottom: 0;
+.report-summary-item span,
+.report-summary-item strong {
+  white-space: nowrap;
 }
 
 .report-delete-button {

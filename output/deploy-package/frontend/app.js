@@ -36,9 +36,7 @@
   initializeApp();
 
   async function initializeApp() {
-    if (!["/", "/login"].includes(getPath())) {
-      await refreshCurrentUser();
-    }
+    await refreshCurrentUser();
     authReady = true;
     renderRoute();
   }
@@ -64,8 +62,16 @@
       return;
     }
     const path = getPath();
+    if (["/", "/login"].includes(path) && currentUser) {
+      navigate(getDefaultRouteForUser(currentUser));
+      return;
+    }
     const renderer = routes[path] || renderNotFound;
     renderer();
+  }
+
+  function getDefaultRouteForUser(user) {
+    return user?.role === "employee" ? "/employee" : "/admin/accounts";
   }
 
   function readData() {
@@ -297,11 +303,7 @@
   }
 
   async function logoutCurrentUser() {
-    try {
-      await apiRequest("/api/auth/logout", { method: "POST" });
-    } catch (error) {
-      // 即使服务端已经没有登录态，也清理前端内存状态并回到登录页。
-    }
+    // 保留服务端登录凭证，让这台设备下次打开时可以自动登录。
     clearCurrentUser();
   }
 
@@ -341,7 +343,6 @@
   }
 
   function renderLogin() {
-    clearCurrentUser();
     app.innerHTML = `
       <main class="app-page login-layout">
         ${renderAppHeader()}
@@ -410,7 +411,7 @@
     try {
       const user = await loginSharedAccount(account, password);
       setCurrentUser(user);
-      navigate(user.role === "employee" ? "/employee" : "/admin/accounts");
+      navigate(getDefaultRouteForUser(user));
     } catch (loginError) {
       error.classList.add("is-visible");
     }
@@ -453,10 +454,11 @@
     }
 
     const hasSavedReport = Boolean(report.rows && report.rows.length);
-    const rows = normalizeReportRows(report.rows || []);
+    const rows = hasSavedReport ? normalizeSavedReportRows(report.rows || []) : normalizeReportRows(processes, report.rows || []);
     const dailyWage = calculateDailyWage(rows);
     const savedDailyWage = Number(report.dailyWage) || (report.rows || []).reduce((sum, row) => sum + (Number(row.totalPrice) || 0), 0);
     const monthTotalWage = Number(monthSummary?.summary?.totalWage) || 0;
+    const monthWorkDays = Number(monthSummary?.summary?.workDays) || 0;
     const monthlyWageBase = Math.max(0, monthTotalWage - savedDailyWage);
     const monthlyWage = monthlyWageBase + dailyWage;
 
@@ -464,42 +466,49 @@
       <main class="app-page employee-layout">
         ${renderAppHeader()}
         <section class="employee-shell">
+          <div class="report-summary-bar report-top-summary" aria-label="工资汇总">
+            <div class="report-summary-item">
+              <span>当日工资：</span>
+              <strong id="dailyWage">¥${dailyWage.toFixed(2)}</strong>
+            </div>
+            <div class="report-summary-item">
+              <span>当月工资：</span>
+              <strong id="monthlyWage">¥${monthlyWage.toFixed(2)}</strong>
+            </div>
+          </div>
           <section class="panel report-panel">
             <div class="report-date-row">
-              <label for="workDate">日期</label>
+              <span class="report-month-workdays">当月上班：<strong>${monthWorkDays}</strong>天</span>
+              <label for="workDate">日期：</label>
               <input class="input report-date-input" id="workDate" type="date" value="${workDate}" max="${today}" />
             </div>
             ${hasSavedReport ? `<p class="report-lock-note">该日期已报工，记录不能再次提交或修改。</p>` : ""}
             <div class="report-table-wrap">
-              <table class="report-table">
-                <thead>
-                  <tr>
-                    <th>工序</th>
-                    <th>单价</th>
-                    <th>数量</th>
-                    <th>总价</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="reportRows">
-                  ${rows.map((row, index) => renderReportRow(row, index, processes, hasSavedReport)).join("")}
-                </tbody>
-                <tfoot>
-                  <tr>
-                    <td>当日工资</td>
-                    <td colspan="4" id="dailyWage">¥${dailyWage.toFixed(2)}</td>
-                  </tr>
-                  <tr>
-                    <td>当月工资</td>
-                    <td colspan="4" id="monthlyWage">¥${monthlyWage.toFixed(2)}</td>
-                  </tr>
-                </tfoot>
-              </table>
+              <div class="report-table-body-wrap">
+                <table class="report-table">
+                  <thead>
+                    <tr>
+                      <th>工序</th>
+                      <th>单价</th>
+                      <th>数量</th>
+                      <th>总价</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="reportRows">
+                    ${
+                      rows.length
+                        ? rows.map((row, index) => renderReportRow(row, index, processes, hasSavedReport)).join("")
+                        : `<tr><td colspan="5" class="history-empty">暂无可报工工序</td></tr>`
+                    }
+                  </tbody>
+                </table>
+              </div>
             </div>
           </section>
-          <div class="action-row">
-            <button class="button button-success button-large" id="saveReportButton" type="button" ${hasSavedReport ? "disabled" : ""}>${hasSavedReport ? "已报工" : "提交报工"}</button>
-            <button class="button button-primary button-large" id="employeeQueryButton" type="button">数据查询</button>
+          <div class="action-row report-bottom-actions">
+            <button class="button button-success report-action-button" id="saveReportButton" type="button" ${hasSavedReport ? "disabled" : ""}>${hasSavedReport ? "已报工" : "提交报工"}</button>
+            <button class="button button-primary report-action-button" id="employeeQueryButton" type="button">数据查询</button>
           </div>
           <div class="employee-logout-row">
             <button class="button button-secondary button-large" id="logoutButton" type="button">退出登录</button>
@@ -1092,30 +1101,31 @@
     });
   }
 
-  function normalizeReportRows(savedRows) {
-    const filledRows = savedRows.map((row) => ({
+  function getReportRowHelpers() {
+    return window.ReportRowHelpers || {};
+  }
+
+  function normalizeReportRows(processes, savedRows) {
+    const helpers = getReportRowHelpers();
+    if (helpers.buildFixedReportRows) {
+      return helpers.buildFixedReportRows(processes, savedRows);
+    }
+
+    return (processes || []).map((process) => ({
+      processId: process.id,
+      processName: process.name,
+      unitPrice: Number(process.price) || 0,
+      quantity: "",
+    }));
+  }
+
+  function normalizeSavedReportRows(savedRows) {
+    return (savedRows || []).map((row) => ({
       processId: row.processId || "",
       processName: row.processName || "",
       unitPrice: Number(row.unitPrice) || 0,
-      quantity: row.quantity ? String(row.quantity) : "",
+      quantity: row.quantity === null || row.quantity === undefined ? "" : String(row.quantity),
     }));
-
-    return ensureReportRowRules(filledRows);
-  }
-
-  function ensureReportRowRules(rows) {
-    const nextRows = rows.slice();
-    const blankCount = nextRows.filter((row) => !row.processId && !row.quantity).length;
-
-    for (let index = blankCount; index < 2; index += 1) {
-      nextRows.push({ processId: "", processName: "", unitPrice: 0, quantity: "" });
-    }
-
-    while (nextRows.length < 5) {
-      nextRows.push({ processId: "", processName: "", unitPrice: 0, quantity: "" });
-    }
-
-    return nextRows;
   }
 
   function renderReportRow(row, index, processes, readonly = false) {
@@ -1128,26 +1138,20 @@
     return `
       <tr data-report-row="${index}">
         <td>
-          <div class="report-process-control">
-            <input class="report-input report-process-input" data-field="processName" value="${escapeHtml(processName)}" placeholder="工序" autocomplete="off" inputmode="none" readonly aria-label="工序" />
-            <button class="report-process-picker" data-action="open-process-options" type="button" aria-label="显示工序选项" ${readonly ? "disabled" : ""}></button>
-            <input data-field="processId" type="hidden" value="${escapeHtml(row.processId)}" />
-            <div class="report-process-menu" data-process-menu>
-              ${processes.map((process) => `<button class="report-process-option" data-action="select-process-option" data-process-name="${escapeHtml(process.name)}" type="button">${escapeHtml(process.name)}</button>`).join("")}
-            </div>
-          </div>
+          <span class="report-process-name">${escapeHtml(processName)}</span>
+          <input data-field="processId" type="hidden" value="${escapeHtml(row.processId)}" />
         </td>
         <td>
           <input class="report-input report-price-input" data-field="unitPrice" value="${unitPrice ? `¥${unitPrice.toFixed(2)}` : ""}" readonly aria-label="单价" />
         </td>
         <td>
-          <input class="report-input report-quantity-input" data-field="quantity" type="number" min="0" step="0.01" value="${escapeHtml(row.quantity)}" aria-label="数量" ${readonly ? "readonly" : ""} />
+          <input class="report-input report-quantity-input" data-field="quantity" type="text" inputmode="decimal" pattern="[0-9]*[.]?[0-9]*" value="${escapeHtml(row.quantity)}" aria-label="数量" ${readonly ? "readonly" : ""} />
         </td>
         <td>
           <input class="report-input report-total-input" data-field="totalPrice" value="${totalPrice ? `¥${totalPrice.toFixed(2)}` : ""}" readonly aria-label="总价" />
         </td>
         <td>
-          <button class="report-delete-button" data-action="delete-report-row" type="button" aria-label="删除本行" ${readonly ? "disabled" : ""}>删除</button>
+          <button class="report-delete-button" data-action="clear-report-row" type="button" aria-label="清空本行数量" ${readonly ? "disabled" : ""}>删除</button>
         </td>
       </tr>
     `;
@@ -1155,13 +1159,12 @@
 
   function readReportRowsFromDom(processes) {
     return Array.from(document.querySelectorAll("[data-report-row]")).map((rowElement) => {
-      const processInput = rowElement.querySelector("[data-field='processName']");
+      const processId = rowElement.querySelector("[data-field='processId']")?.value || "";
       const quantity = rowElement.querySelector("[data-field='quantity']").value;
-      const processName = processInput.value.trim();
-      const process = processes.find((item) => item.name === processName);
+      const process = processes.find((item) => item.id === processId);
       return {
         processId: process ? process.id : "",
-        processName,
+        processName: process ? process.name : "",
         unitPrice: process ? Number(process.price) : 0,
         quantity,
       };
@@ -1195,36 +1198,15 @@
   }
 
   function refreshReportTable(processes, monthlyWageBase) {
-    const rows = ensureReportRowRules(readReportRowsFromDom(processes));
+    const rows = readReportRowsFromDom(processes);
     document.querySelector("#reportRows").innerHTML = rows.map((row, index) => renderReportRow(row, index, processes)).join("");
     refreshReportSummary(processes, monthlyWageBase);
     bindReportRowEvents(processes, monthlyWageBase);
   }
 
-  function appendReportBlankRowsIfNeeded(processes, monthlyWageBase) {
-    const rows = readReportRowsFromDom(processes);
-    const blankCount = rows.filter((row) => !row.processName && !row.quantity).length;
-    if (blankCount >= 2) return;
-
-    const reportRows = document.querySelector("#reportRows");
-    const startIndex = rows.length;
-    const rowsToAdd = Array.from({ length: 2 - blankCount }, () => ({
-      processId: "",
-      processName: "",
-      unitPrice: 0,
-      quantity: "",
-    }));
-
-    reportRows.insertAdjacentHTML(
-      "beforeend",
-      rowsToAdd.map((row, index) => renderReportRow(row, startIndex + index, processes)).join("")
-    );
-    bindReportRowEvents(processes, monthlyWageBase);
-  }
-
   function refreshSingleReportRow(rowElement, processes, monthlyWageBase) {
-    const processName = rowElement.querySelector("[data-field='processName']").value.trim();
-    const process = processes.find((item) => item.name === processName);
+    const processId = rowElement.querySelector("[data-field='processId']")?.value || "";
+    const process = processes.find((item) => item.id === processId);
     const quantity = Number(rowElement.querySelector("[data-field='quantity']").value) || 0;
     const unitPrice = process ? Number(process.price) : 0;
     const totalPrice = unitPrice * quantity;
@@ -1233,18 +1215,6 @@
     rowElement.querySelector("[data-field='unitPrice']").value = unitPrice ? `¥${unitPrice.toFixed(2)}` : "";
     rowElement.querySelector("[data-field='totalPrice']").value = totalPrice ? `¥${totalPrice.toFixed(2)}` : "";
     refreshReportSummary(processes, monthlyWageBase);
-  }
-
-  function closeProcessMenus() {
-    document.querySelectorAll(".report-process-control.is-open").forEach((control) => {
-      control.classList.remove("is-open");
-    });
-  }
-
-  function filterProcessMenu(rowElement) {
-    rowElement.querySelectorAll(".report-process-option").forEach((option) => {
-      option.hidden = false;
-    });
   }
 
   function refreshReportSummary(processes, monthlyWageBase) {
@@ -1260,63 +1230,20 @@
       input.dataset.reportBound = "true";
       input.addEventListener("change", () => {
         refreshSingleReportRow(input.closest("[data-report-row]"), processes, monthlyWageBase);
-        appendReportBlankRowsIfNeeded(processes, monthlyWageBase);
       });
       input.addEventListener("input", () => {
         refreshSingleReportRow(input.closest("[data-report-row]"), processes, monthlyWageBase);
-        appendReportBlankRowsIfNeeded(processes, monthlyWageBase);
       });
     });
-    document.querySelectorAll(".report-process-input").forEach((input) => {
-      if (input.dataset.reportBound) return;
-      input.dataset.reportBound = "true";
-      input.addEventListener("click", () => {
-        const rowElement = input.closest("[data-report-row]");
-        const control = rowElement?.querySelector(".report-process-control");
-        if (!control) return;
-
-        const shouldOpen = !control.classList.contains("is-open");
-        closeProcessMenus();
-        filterProcessMenu(rowElement);
-        control.classList.toggle("is-open", shouldOpen);
-      });
-    });
-    document.querySelectorAll("[data-action='delete-report-row']").forEach((button) => {
+    document.querySelectorAll("[data-action='clear-report-row']").forEach((button) => {
       if (button.dataset.reportBound) return;
       button.dataset.reportBound = "true";
       button.addEventListener("click", () => {
         const rowElement = button.closest("[data-report-row]");
         if (!rowElement) return;
-        rowElement.remove();
-        refreshReportTable(processes, monthlyWageBase);
-      });
-    });
-    document.querySelectorAll("[data-action='open-process-options']").forEach((button) => {
-      if (button.dataset.reportBound) return;
-      button.dataset.reportBound = "true";
-      button.addEventListener("click", () => {
-        const rowElement = button.closest("[data-report-row]");
-        const control = rowElement?.querySelector(".report-process-control");
-        const processInput = rowElement?.querySelector("[data-field='processName']");
-        if (!control || !processInput) return;
-
-        const shouldOpen = !control.classList.contains("is-open");
-        closeProcessMenus();
-        processInput.blur();
-        filterProcessMenu(rowElement);
-        control.classList.toggle("is-open", shouldOpen);
-      });
-    });
-    document.querySelectorAll("[data-action='select-process-option']").forEach((button) => {
-      if (button.dataset.reportBound) return;
-      button.dataset.reportBound = "true";
-      button.addEventListener("click", () => {
-        const rowElement = button.closest("[data-report-row]");
-        const processInput = rowElement.querySelector("[data-field='processName']");
-        processInput.value = button.dataset.processName;
+        const quantityInput = rowElement.querySelector("[data-field='quantity']");
+        if (quantityInput) quantityInput.value = "";
         refreshSingleReportRow(rowElement, processes, monthlyWageBase);
-        appendReportBlankRowsIfNeeded(processes, monthlyWageBase);
-        closeProcessMenus();
       });
     });
   }
@@ -1494,7 +1421,10 @@
         return;
       }
 
-      const rows = validRows.map((row) => ({ process_id: row.processId, quantity: Number(row.quantity) }));
+      const helpers = getReportRowHelpers();
+      const rows = helpers.getSubmittableReportRows
+        ? helpers.getSubmittableReportRows(validRows)
+        : validRows.map((row) => ({ process_id: row.processId, quantity: Number(row.quantity) }));
 
       try {
         await saveWorkReport(accountId, workDate, rows);

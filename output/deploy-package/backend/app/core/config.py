@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     database_url: str
     frontend_origins: str = "http://127.0.0.1:8080,http://localhost:8080"
     session_cookie_name: str = "employee_work_session"
-    session_ttl_seconds: int = 60 * 60 * 12
+    session_ttl_seconds: int = 60 * 60 * 24 * 365
     session_cookie_secure: bool | None = None
     password_view_secret: str | None = None
     login_max_failures: int = 5
