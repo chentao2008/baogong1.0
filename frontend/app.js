@@ -77,7 +77,13 @@
   }
 
   function getApiBaseUrl() {
+    if (window.EMPLOYEE_WORK_API_BASE_URL) {
+      return window.EMPLOYEE_WORK_API_BASE_URL;
+    }
     const host = window.location.hostname || "127.0.0.1";
+    if (!window.location.port || window.location.port === "80" || window.location.port === "443") {
+      return `${window.location.protocol || "http:"}//${host}`;
+    }
     return `${window.location.protocol || "http:"}//${host}:8000`;
   }
 
